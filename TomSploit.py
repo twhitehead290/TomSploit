@@ -20,10 +20,12 @@
 
 import argparse
 import ipaddress
+import json
 import os
 import re
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from threading import Lock
@@ -37,6 +39,24 @@ CYAN = "\033[96m"
 BOLD = "\033[1m"
 DIM = "\033[2m"
 RESET = "\033[0m"
+
+# Original ANSI values kept so _configure_colors can restore them if needed
+_COLOR_DEFAULTS = {
+    "RED": "\033[91m", "GREEN": "\033[92m", "YELLOW": "\033[93m",
+    "BLUE": "\033[94m", "CYAN": "\033[96m", "BOLD": "\033[1m",
+    "DIM": "\033[2m", "RESET": "\033[0m",
+}
+
+
+def _configure_colors(no_color: bool) -> None:
+    """Strip ANSI codes when stdout is not a TTY or --no-color is set."""
+    global RED, GREEN, YELLOW, BLUE, CYAN, BOLD, DIM, RESET
+    if no_color or not sys.stdout.isatty():
+        RED = GREEN = YELLOW = BLUE = CYAN = BOLD = DIM = RESET = ""
+    else:
+        for name, val in _COLOR_DEFAULTS.items():
+            globals()[name] = val
+
 
 ALL_PROTOCOLS = ["smb", "ssh", "ldap", "ftp", "wmi", "winrm", "rdp", "vnc", "mssql", "nfs"]
 LOCAL_AUTH_PROTOCOLS = {"smb", "wmi", "winrm", "rdp", "mssql"}
@@ -143,6 +163,8 @@ class NxcAutomator:
         output: str | None = None,
         workers: int = DEFAULT_WORKERS,
         mode: str = "combination",
+        quiet: bool = False,
+        json_output: str | None = None,
     ):
         self.targets = self._read_value_or_file(target)
         self.users = self._read_value_or_file(user)
@@ -151,10 +173,13 @@ class NxcAutomator:
         self.mode = mode.lower()
         self.credential_pairs = self._build_credential_pairs()
         self.workers = workers
+        self.quiet = quiet
+        self.json_output = json_output
         self.lock = Lock()
         self.completed = 0
         self.total_tasks = 0
-        self.log_file = output if output else datetime.now().strftime("%H-%M-%S-%f")[:-3] + ".txt"
+        self.scan_start_time: float = 0.0
+        self.log_file = output if output else datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".txt"
 
     @staticmethod
     def _read_lines(path: str) -> list[str]:
@@ -200,7 +225,19 @@ class NxcAutomator:
             filled = int(bar_len * self.completed / self.total_tasks)
             bar = f"{'█' * filled}{'░' * (bar_len - filled)}"
             pct = int(100 * self.completed / self.total_tasks)
-            sys.stderr.write(f"\r  {DIM}{bar} {pct:3d}% ({self.completed}/{self.total_tasks}){RESET}")
+
+            elapsed = time.time() - self.scan_start_time if self.scan_start_time else 0
+            if elapsed > 0 and self.completed > 0:
+                rate = self.completed / elapsed
+                remaining = self.total_tasks - self.completed
+                eta_secs = int(remaining / rate)
+                eta_str = f" ETA {eta_secs}s" if eta_secs < 9999 else " ETA --"
+            else:
+                eta_str = ""
+
+            sys.stderr.write(
+                f"\r  {DIM}{bar} {pct:3d}% ({self.completed}/{self.total_tasks}){eta_str}{RESET}"
+            )
             sys.stderr.flush()
 
     def _update_progress(self):
@@ -356,7 +393,6 @@ class NxcAutomator:
             stderr = (result.stderr or "").strip()
             if stdout:
                 output_lines.append(stdout)
-                # Report any [+] hits live
                 for raw_line in stdout.split("\n"):
                     marker, msg = self._parse_nxc_line(raw_line.strip())
                     if marker == "[+]":
@@ -518,6 +554,7 @@ class NxcAutomator:
     def _collect_target_results(self, target: str, tasks: list[TaskKey], pair_count: int) -> dict[TaskKey, list[str]]:
         self.completed = 0
         self.total_tasks = len(tasks) * pair_count
+        self.scan_start_time = time.time()
         results: dict[TaskKey, list[str]] = {}
 
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
@@ -540,11 +577,12 @@ class NxcAutomator:
         results: dict[TaskKey, list[str]],
         tasks: list[TaskKey],
         anon_smb_results: list[str],
-    ):
+        elapsed: float = 0.0,
+    ) -> tuple[list[tuple[str, str]], bool, str, str]:
+        """Print per-target results. Returns (successes, is_dc, hostname, real_ip)."""
         target_info = self._extract_target_info(results)
         is_dc = self._is_domain_controller(target_info)
         real_ip = self._extract_real_ip(results, anon_smb_results) or target
-        # Pull hostname from nxc's "name:DC01" field in the [*] info line
         hostname = ""
         if target_info:
             m = re.search(r"name:([^\s)]+)", target_info, re.IGNORECASE)
@@ -554,10 +592,11 @@ class NxcAutomator:
         print(f"\n{'─' * BANNER_WIDTH}")
         dc_label = f" {YELLOW}{BOLD}[Domain Controller]{RESET}" if is_dc else ""
         ip_label = f" {DIM}({real_ip}){RESET}" if real_ip != target else ""
-        print(f"  {CYAN}{BOLD}📋 NetExec Automator Results{RESET}{ip_label}{dc_label}")
+        elapsed_label = f" {DIM}[{elapsed:.1f}s]{RESET}" if elapsed > 0 else ""
+        print(f"  {CYAN}{BOLD}📋 NetExec Automator Results{RESET}{ip_label}{dc_label}{elapsed_label}")
         print(f"{'─' * BANNER_WIDTH}")
 
-        if target_info:
+        if target_info and not self.quiet:
             print(f"    {DIM}{target_info}{RESET}")
         print()
 
@@ -578,7 +617,7 @@ class NxcAutomator:
                     if marker == "[+]":
                         print(f"{prefix} {YELLOW}{msg}{RESET}")
                         successes.append((label, msg))
-                    elif marker == "[-]":
+                    elif marker == "[-]" and not self.quiet:
                         print(f"{prefix} {DIM}{msg}{RESET}")
                     elif marker == "[!]":
                         print(f"{prefix} {YELLOW}{msg}{RESET}")
@@ -610,12 +649,12 @@ class NxcAutomator:
                 if marker == "[+]":
                     print(f"{prefix} {GREEN}{msg}{RESET}")
                     successes.append((label, msg))
-                elif marker == "[-]":
+                elif marker == "[-]" and not self.quiet:
                     print(f"{prefix} {DIM}{msg}{RESET}")
                 elif marker == "[!]":
                     print(f"{prefix} {YELLOW}{msg}{RESET}")
 
-        if no_output_protos:
+        if no_output_protos and not self.quiet:
             ordered = [p for p in ALL_PROTOCOLS if p.upper() in no_output_protos]
             names = ", ".join(p.upper() for p in ordered)
             print(f"\n  {DIM}── No response: {names}{RESET}")
@@ -632,22 +671,72 @@ class NxcAutomator:
             cred_successes = [(l, m) for l, m in successes if "(anon)" not in l]
             if cred_successes:
                 self._print_suggested_commands(real_ip, cred_successes, is_dc, hostname)
-        else:
+        elif not self.quiet:
             print(f"\n  {RED}{BOLD}✗ No valid credentials found.{RESET}\n")
 
         print(f"{'═' * BANNER_WIDTH}\n")
+        return successes, is_dc, hostname, real_ip
+
+    def _print_summary_table(self, summary: list[dict]):
+        """Print a rollup table after scanning multiple targets."""
+        total_success = sum(1 for s in summary if s["successes"])
+        print(f"\n{BOLD}{'═' * BANNER_WIDTH}{RESET}")
+        print(f"  {CYAN}{BOLD}📊 Scan Summary{RESET}  {DIM}({len(summary)} targets){RESET}")
+        print(f"{'═' * BANNER_WIDTH}")
+        for entry in summary:
+            has_creds = bool(entry["successes"])
+            icon = f"{GREEN}✔{RESET}" if has_creds else f"{RED}✘{RESET}"
+            host_label = entry["target"]
+            if entry["hostname"]:
+                host_label += f" {DIM}({entry['hostname']}){RESET}"
+            if entry["is_dc"]:
+                host_label += f" {YELLOW}[DC]{RESET}"
+            time_label = f" {DIM}[{entry['elapsed']:.1f}s]{RESET}"
+            cred_count = len(entry["successes"])
+            cred_label = f" {GREEN}{cred_count} cred{'s' if cred_count != 1 else ''}{RESET}" if has_creds else ""
+            print(f"  {icon} {host_label}{cred_label}{time_label}")
+        print(f"\n  Total: {GREEN}{BOLD}{total_success}{RESET}/{len(summary)} targets with valid credentials")
+        print(f"{'═' * BANNER_WIDTH}\n")
+
+    def _write_json_output(self, summary: list[dict]):
+        """Write scan findings to a JSON file."""
+        output = {
+            "scan_time": datetime.now().isoformat(),
+            "log_file": self.log_file,
+            "targets": [
+                {
+                    "target": entry["target"],
+                    "real_ip": entry["real_ip"],
+                    "hostname": entry["hostname"],
+                    "is_dc": entry["is_dc"],
+                    "elapsed_seconds": round(entry["elapsed"], 2),
+                    "successes": [
+                        {"protocol": label, "credential": msg}
+                        for label, msg in entry["successes"]
+                    ],
+                }
+                for entry in summary
+            ],
+        }
+        with open(self.json_output, "w") as f:
+            json.dump(output, f, indent=2)
+        print(f"  {DIM}JSON output written to {self.json_output}{RESET}\n")
 
     def run(self):
         task_count = len(ALL_PROTOCOLS) + len(LOCAL_AUTH_PROTOCOLS)
         pair_count = len(self.credential_pairs)
         total_attempts = len(self.targets) * pair_count * task_count
 
-        self._print_scan_banner(total_attempts)
+        if not self.quiet:
+            self._print_scan_banner(total_attempts)
+
+        summary: list[dict] = []
 
         for target in self.targets:
             print(f"  {GREEN}{BOLD}► {target}{RESET}\n")
 
             tasks = self._build_protocol_tasks()
+            target_start = time.time()
 
             # Run anonymous SMB check and credentialled scans concurrently
             anon_smb_results: list[str] = []
@@ -657,9 +746,29 @@ class NxcAutomator:
                 anon_smb_results = anon_future.result()
                 results = cred_future.result()
 
+            elapsed = time.time() - target_start
+
             sys.stderr.write("\r" + " " * PROGRESS_CLEAR_WIDTH + "\r")
             sys.stderr.flush()
-            self._print_target_results(target, results, tasks, anon_smb_results)
+
+            successes, is_dc, hostname, real_ip = self._print_target_results(
+                target, results, tasks, anon_smb_results, elapsed
+            )
+
+            summary.append({
+                "target": target,
+                "real_ip": real_ip,
+                "hostname": hostname,
+                "is_dc": is_dc,
+                "elapsed": elapsed,
+                "successes": successes,
+            })
+
+        if len(self.targets) > 1:
+            self._print_summary_table(summary)
+
+        if self.json_output:
+            self._write_json_output(summary)
 
 
 def parse_mode(value: str) -> str:
@@ -687,6 +796,15 @@ examples:
 
   # Linear mode (pairs users[0]:passwords[0], users[1]:passwords[1], ...)
   netexec-automator -t targets.txt -u users.txt -p passwords.txt -m linear
+
+  # Quiet mode — suppress banner and negative results, show findings only
+  netexec-automator -t 192.168.1.10 -u admin -p 'Password123' -q
+
+  # Disable color for piped/logged output
+  netexec-automator -t 192.168.1.10 -u admin -p 'Password123' --no-color | tee scan.txt
+
+  # Write findings to a JSON file
+  netexec-automator -t targets.txt -u users.txt -p passwords.txt --json-output results.json
         """
     )
     parser.add_argument("-t", "--target",   required=True,
@@ -699,7 +817,7 @@ examples:
                         help="NTLM hash (LM:NT or :NT) — used to populate pass-the-hash "
                              "command suggestions in output (e.g. -H aad3b...:31d6c...)")
     parser.add_argument("-o", "--output",
-                        help="Custom log file path (default: HH-MM-SS-mmm.txt)")
+                        help="Custom log file path (default: YYYY-MM-DD_HH-MM-SS.txt)")
     parser.add_argument("-w", "--workers",  type=int, default=DEFAULT_WORKERS,
                         help=f"Number of parallel threads (default: {DEFAULT_WORKERS})")
     parser.add_argument(
@@ -710,11 +828,18 @@ examples:
         help="Credential pairing mode: combination (cartesian product, default) "
              "or linear (index-matched pairs)",
     )
+    parser.add_argument("-q", "--quiet",    action="store_true",
+                        help="Suppress banner and negative results; show findings only")
+    parser.add_argument("--no-color",       action="store_true",
+                        help="Disable ANSI color codes (auto-detected for non-TTY output)")
+    parser.add_argument("--json-output",    metavar="FILE",
+                        help="Write findings to a JSON file at the given path")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    _configure_colors(args.no_color)
     try:
         runner = NxcAutomator(
             target=args.target,
@@ -724,6 +849,8 @@ def main():
             output=args.output,
             workers=args.workers,
             mode=args.mode,
+            quiet=args.quiet,
+            json_output=args.json_output,
         )
         runner.run()
     except ValueError as exc:
