@@ -26,8 +26,11 @@ Demo
     Windows Server 2019 (name:DC01) (domain:corp.local)
 
   ✔ SMB (domain)         DC01 corp.local\admin:Password123! (Pwn3d!)
+  
   ✔ LDAP (domain)        DC01 corp.local\admin:Password123!
+  
   ✔ WMI (domain)         DC01 corp.local\admin:Password123! (Pwn3d!)
+  
   ✔ WINRM (domain)       DC01 corp.local\admin:Password123! (Pwn3d!)
 
 
