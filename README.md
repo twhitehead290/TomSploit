@@ -7,10 +7,10 @@ git clone https://github.com/twhitehead290/TomSploit.git
 
 chmod +x /path/to/TomSploit.py
 
-sudo cp /path/to/TomSploit.py /usr/local/bin/TomSploit
+sudo cp /path/to/TomSploit.py /usr/local/bin/tomsploit
 
 # Usage
 
-netexec-automator -t TARGET -u USER -p PASSWORD
+tomsploit -t TARGET -u USER -p PASSWORD
 
-netexec-automator -t live_hosts.txt -u USER -p PASSWORD
+tomsploit -t live_hosts.txt -u USER -p PASSWORD
