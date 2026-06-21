@@ -1524,7 +1524,7 @@ def parse_combo_file(path: str) -> tuple[list[str], list[str], list[str], list[s
     hashes: list[str] = []
     warnings: list[str] = []
     try:
-        with open(path) as f:
+        with open(path, encoding="latin-1") as f:
             lines = [ln.rstrip("\n") for ln in f]
     except OSError as exc:
         raise ValueError(f"Cannot read '{path}': {exc}") from exc
@@ -1554,7 +1554,9 @@ def parse_combo_file(path: str) -> tuple[list[str], list[str], list[str], list[s
 def read_value_or_file(source: str) -> list[str]:
     if os.path.isfile(source):
         try:
-            with open(source) as f:
+            # latin-1: maps every byte 0x00-0xFF to a char, so wordlists with
+            # non-UTF-8 bytes (e.g. rockyou.txt) never raise UnicodeDecodeError.
+            with open(source, encoding="latin-1") as f:
                 return [line.strip() for line in f if line.strip()]
         except OSError as exc:
             raise ValueError(f"Cannot read '{source}': {exc}") from exc
@@ -2077,7 +2079,14 @@ class TomSploit:
             ssh.extend(TomSploit._SSH_LEGACY_OPTS)
         ssh.extend([
             f"{user}@{target}",
-            f"echo {marker}; id 2>/dev/null",
+            # Marker ONLY — deliberately no 'id' and no '2>/dev/null'. The remote
+            # shell may be Windows cmd.exe / PowerShell (OpenSSH for Windows),
+            # where ';' is not a command separator and a '2>/dev/null' redirect
+            # targets the non-existent path \dev\null — cmd then ABORTS the
+            # command without running it, so the marker never prints and a VALID
+            # login is misreported as "auth failed". A bare 'echo <marker>' runs
+            # identically on cmd, PowerShell, sh and bash.
+            f"echo {marker}",
         ])
         return ["sshpass", "-p", secret, *ssh]
 
