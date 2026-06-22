@@ -2018,6 +2018,11 @@ class TomSploit:
                     self._tick(); continue
                 combined = f"{stdout}\n{stderr}"
 
+            if self.cfg.debug:
+                self._say(f"  {DIM}[ssh debug] {' '.join(cmd[3:])}{RESET}")
+                self._say(f"  {DIM}[ssh debug] stdout={stdout!r}{RESET}")
+                self._say(f"  {DIM}[ssh debug] stderr={stderr!r}{RESET}")
+
             if self._SSH_MARKER in stdout:
                 # Genuine shell access.
                 success = Success(
@@ -2070,7 +2075,7 @@ class TomSploit:
             "-o", "UserKnownHostsFile=/dev/null",
             "-o", "GlobalKnownHostsFile=/dev/null",
             "-o", "ConnectTimeout=10",
-            "-o", "PreferredAuthentications=password",
+            "-o", "PreferredAuthentications=password,keyboard-interactive",
             "-o", "PubkeyAuthentication=no",
             "-o", "NumberOfPasswordPrompts=1",
             "-o", "LogLevel=ERROR",
