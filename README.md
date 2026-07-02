@@ -119,7 +119,8 @@ Graceful Ctrl-C — first cancels in-flight calls, second forces exit
 
 Install
 Single-file Python script, no packaging required:
-bashgit clone https://github.com/<your-user>/tomsploit.git
+bash
+git clone https://github.com/<your-user>/tomsploit.git
 cd tomsploit
 chmod +x tomsploit.py
 sudo cp tomsploit.py /usr/local/bin/tomsploit   # optional
