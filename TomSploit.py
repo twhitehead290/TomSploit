@@ -2701,17 +2701,25 @@ def main() -> int:
     args = parse_args()
     configure_colors(args.no_color)
 
-    if not shutil.which("nxc"):
-        print(f"{RED}{BOLD}Error:{RESET} 'nxc' (NetExec) not on PATH.",
-              file=sys.stderr)
-        return 1
-
     try:
         cfg = build_config(args)
         reporter = Reporter(cfg)
         runner = TomSploit(cfg, reporter)
     except ValueError as exc:
         print(f"{RED}{BOLD}Error:{RESET} {exc}", file=sys.stderr)
+        return 1
+
+    # nxc is only required for the protocols that use it; SSH uses the ssh client,
+    # so `--protocols ssh` works on a box that doesn't have NetExec installed.
+    nxc_protos = [p for p in cfg.protocols if p != "ssh"]
+    if nxc_protos and not shutil.which("nxc"):
+        print(f"{RED}{BOLD}Error:{RESET} 'nxc' (NetExec) not on PATH — required for "
+              f"{', '.join(nxc_protos)}. Install NetExec, or use --protocols ssh.",
+              file=sys.stderr)
+        return 1
+    if not nxc_protos and not shutil.which("ssh"):
+        print(f"{RED}{BOLD}Error:{RESET} ssh client not on PATH "
+              f"(needed for --protocols ssh).", file=sys.stderr)
         return 1
 
     interrupted = {"n": 0}
