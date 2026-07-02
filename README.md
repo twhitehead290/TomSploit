@@ -1,10 +1,5 @@
 A NetExec orchestrator built around an enumeration workflow: test one credential set against every relevant protocol on every host, and when something works, print the exact commands you'd normally tab back to your notes for.
 
-Why
-
-You're a few hours into an exam machine. You spray creds, SMB lights up green, and now you're googling "impacket secretsdump just-dc syntax" again. Or "evil-winrm hash flag". Or "xfreerdp pass the hash."
-tomsploit removes that friction. When a credential works, it prints follow-up commands with your username, password, hash, IP, and domain already filled in — copy, paste, run.
-
 Demo 
 
 ⚡ tomsploit
