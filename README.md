@@ -1,4 +1,4 @@
-A NetExec orchestrator built around the OSCP enumeration workflow: test one credential set against every relevant protocol on every host, and when something works, print the exact commands you'd normally tab back to your notes for.
+A NetExec orchestrator built around an enumeration workflow: test one credential set against every relevant protocol on every host, and when something works, print the exact commands you'd normally tab back to your notes for.
 
 Why
 
