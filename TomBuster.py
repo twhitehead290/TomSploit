@@ -19,6 +19,7 @@ Run it with sudo (UDP and the SYN sweep both want root).
 
 import argparse
 import atexit
+import ipaddress
 import os
 import re
 import shutil
@@ -111,6 +112,105 @@ def merge_services(base: list[OpenPort], detail: list[OpenPort]) -> list[OpenPor
         if p.port in by_port:
             p.service = by_port[p.port]
     return base
+
+
+# ─── subnet sweep (discovery → live hosts) ─────────────────────────────
+
+# Common OSCP-relevant TCP ports for discovery + the stage-2 scan. Windows
+# hosts usually block ICMP but answer 445/135/3389, so TCP-SYN discovery on
+# these beats a plain ping sweep.
+SWEEP_PORTS = ("21,22,25,53,80,110,111,135,139,143,389,443,445,"
+               "1433,3306,3389,5985,8080")
+
+
+def _ip_key(host: str):
+    """Numeric IP sort (so .100 sorts after .14, not before)."""
+    try:
+        return (0, int(ipaddress.ip_address(host)))
+    except ValueError:
+        return (1, host)
+
+
+def parse_live_hosts(path: Path) -> list[str]:
+    """Hosts that answered discovery ('Status: Up') in an nmap -sn .gnmap,
+    numerically sorted and de-duplicated."""
+    if not path.exists():
+        return []
+    hosts: set[str] = set()
+    for line in path.read_text(errors="replace").splitlines():
+        m = re.match(r"Host:\s+(\S+).*Status:\s+Up", line)
+        if m:
+            hosts.add(m.group(1))
+    return sorted(hosts, key=_ip_key)
+
+
+def parse_hosts_ports(path: Path) -> dict[str, list[OpenPort]]:
+    """Map each host → its open TCP ports from an nmap -oG .gnmap (stage 2)."""
+    result: dict[str, list[OpenPort]] = {}
+    if not path.exists():
+        return result
+    for line in path.read_text(errors="replace").splitlines():
+        if "Ports:" not in line:
+            continue
+        hm = re.match(r"Host:\s+(\S+)", line)
+        if not hm:
+            continue
+        ports: list[OpenPort] = []
+        for m in re.finditer(r"(\d+)/(open(?:\|filtered)?)/(\w+)//([^/]*)/", line):
+            ports.append(OpenPort(proto=m.group(3), port=int(m.group(1)),
+                                  service=m.group(4) or "unknown", state=m.group(2)))
+        if ports:
+            result[hm.group(1)] = sorted(ports, key=lambda p: p.port)
+    return result
+
+
+def run_sweep(cidr: str, outdir: Path) -> None:
+    """Reliable subnet discovery: stage 1 finds live hosts with -sn (TCP-SYN to
+    common ports + ICMP, NO --min-rate — that drops SYN-ACKs on laggy VPNs and
+    gives inconsistent host counts); stage 2 port-scans ONLY the live hosts.
+    Writes ./live_hosts.txt so `tomsploit -t live_hosts.txt` can consume it."""
+    if os.geteuid() != 0:
+        print(f"{YELLOW}⚠ Not root — -sn SYN/ICMP discovery needs raw sockets. "
+              f"Re-run with sudo for accurate results.{RESET}\n")
+
+    print(f"{GREEN}{BOLD}[*] Stage 1 — host discovery: "
+          f"nmap -sn -PS{SWEEP_PORTS} {cidr}{RESET}\n")
+    disc = outdir / "sweep-discovery.gnmap"
+    run_live(["nmap", "-sn", "-PS" + SWEEP_PORTS, "-n", "-T4",
+              "--max-retries", "2", "-oG", str(disc), cidr])
+    live = parse_live_hosts(disc)
+
+    lh = Path.cwd() / "live_hosts.txt"
+    if not live:
+        print(f"\n{RED}[-] No live hosts in {cidr}. On a laggy VPN, re-run "
+              f"(packet loss varies) or widen the -PS port list.{RESET}\n")
+        return
+    lh.write_text("\n".join(live) + "\n")
+    print(f"\n{GREEN}[+] {len(live)} live host(s) → {lh}{RESET}")
+    for h in live:
+        print(f"    {h}")
+    print()
+
+    print(f"{BLUE}{BOLD}[*] Stage 2 — ports on live hosts only: "
+          f"nmap -p {SWEEP_PORTS} --open -iL {lh}{RESET}\n")
+    pscan = outdir / "sweep-ports"
+    run_live(["nmap", "-p", SWEEP_PORTS, "--open", "-T4", "-iL", str(lh),
+              "-oG", f"{pscan}.gnmap", "-oN", f"{pscan}.nmap"])
+    hp = parse_hosts_ports(Path(f"{pscan}.gnmap"))
+
+    print(f"\n{CYAN}{'─' * W}{RESET}")
+    print(f"{CYAN}{BOLD}  Sweep results — {cidr}{RESET}")
+    print(f"{CYAN}{'─' * W}{RESET}")
+    for h in live:
+        ports = hp.get(h, [])
+        if ports:
+            summary = ", ".join(f"{p.port}/{p.service}" for p in ports)
+            print(f"  {GREEN}{h:<16}{RESET} {summary}")
+        else:
+            print(f"  {DIM}{h:<16} (up — no open ports in the scanned set){RESET}")
+    print()
+    print(f"{DIM}Next:  deep-scan a host →  sudo tombuster -t <ip>{RESET}")
+    print(f"{DIM}       triage creds     →  tomsploit -t {lh} --combo creds.txt{RESET}\n")
 
 
 # ─── hostname hints (for web vhosts / /etc/hosts) ──────────────────────
@@ -802,9 +902,14 @@ def parse_args() -> argparse.Namespace:
   sudo tombuster -t target.htb --skip-udp
   sudo tombuster -t 10.10.10.50 --udp-top 50
   sudo tombuster -t 10.10.10.50 --skip-vuln -o ./recon/box1
+  sudo tombuster --sweep 10.10.196.0/24
 """,
     )
-    p.add_argument("-t", "--target", required=True, help="Single IP or hostname.")
+    p.add_argument("-t", "--target", help="Single IP or hostname (deep scan).")
+    p.add_argument("--sweep", metavar="CIDR",
+                   help="Subnet discovery: find live hosts in a CIDR (two-stage, "
+                        "no --min-rate) and write ./live_hosts.txt. "
+                        "e.g. --sweep 10.10.196.0/24")
     p.add_argument("--keep", action="store_true",
                    help="Keep the nmap output dir (named after the target). "
                         "Default: scan in a temp dir and delete it on exit.")
@@ -824,13 +929,28 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     configure_colors(args.no_color)
-    target = args.target.strip()
 
     if not shutil.which("nmap"):
         print(f"{RED}{BOLD}Error:{RESET} nmap not on PATH.", file=sys.stderr)
         return 1
 
-    cleanup_dir: Path | None = None
+    # ── Sweep mode: subnet discovery → live_hosts.txt, then exit ──
+    if args.sweep:
+        if args.target:
+            print(f"{YELLOW}Note: --sweep given; ignoring -t {args.target}.{RESET}\n")
+        sweep_dir = Path(args.output_dir) if args.output_dir else \
+            Path(tempfile.mkdtemp(prefix="tombuster-sweep-"))
+        sweep_dir.mkdir(parents=True, exist_ok=True)
+        if not args.output_dir and not args.keep:
+            atexit.register(shutil.rmtree, sweep_dir, ignore_errors=True)
+        run_sweep(args.sweep.strip(), sweep_dir)
+        return 0
+
+    if not args.target:
+        print(f"{RED}{BOLD}Error:{RESET} give -t <target> for a deep scan, "
+              f"or --sweep <cidr> for subnet discovery.", file=sys.stderr)
+        return 1
+    target = args.target.strip()
     if args.output_dir:
         outdir = Path(args.output_dir)          # explicit location -> kept
     elif args.keep:
