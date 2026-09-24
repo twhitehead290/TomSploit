@@ -3338,7 +3338,6 @@ class Reporter:
             self._guests(result)
         if result.successes:
             self._delegation(result)
-            self._dc_self_delegation_note(result)
             self._suggestions(result)
         print(f"{'═' * BANNER_WIDTH}\n")
 
@@ -3698,31 +3697,7 @@ class Reporter:
             print(f"  {DIM}DC-to-DC unconstrained commands → {RESET}"
                   f"{BOLD}{path}{RESET}\n")
 
-    def _dc_self_delegation_note(self, result: TargetResult) -> None:
-        """The DC you're on is ITSELF unconstrained-delegation-trusted (every DC
-        is, by default) — findDelegation deliberately omits DCs, so it never
-        shows up as a delegation "finding". But with admin here it is a real
-        attack surface: coerce ANOTHER DC (e.g. a parent-domain DC across a
-        trust) to authenticate to this one and capture its TGT.
-
-        Printed independently of whether findDelegation found anything, so a DC
-        with zero delegation findings (the common case) still gets the pointer.
-        """
-        if self.sh or not result.is_dc:
-            return
-        if not any(s.is_admin for s in result.successes):
-            return
-        dcn = result.hostname or "this DC"
-        print(f"  {CYAN}{BOLD}🔑 This DC is unconstrained-trusted{RESET}")
-        print(f"  {'─' * (BANNER_WIDTH - 2)}")
-        print(f"    {DIM}Every DC is trusted for unconstrained delegation, so "
-              f"{dcn} is too — findDelegation omits DCs, so it won't appear as "
-              f"a finding above.{RESET}")
-        print(f"    {DIM}With admin here you can capture ANOTHER DC's TGT: run "
-              f"Rubeus monitor / krbrelayx on {dcn}, then coerce the other DC "
-              f"(e.g. a parent-domain DC over a trust) to authenticate here — "
-              f"then DCSync it. Same PATH (a)/(b) as an unconstrained finding.{RESET}")
-        print()
+    def _suggestions(self, result: TargetResult) -> None:
         # One block per DISTINCT credential (protocol + auth + scope + user),
         # so two different accounts that both authenticate on the same
         # protocol — e.g. a domain user and a local admin on SMB — each get
