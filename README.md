@@ -458,11 +458,16 @@ Run `tomsploit --help` for the complete list.
 
 # tomcrypt
 
-Payload generator. Takes a Metasploit payload string, generates shellcode
+TomCrypt is an OSEP Payload generator developed to automate elements of course. It takes a Metasploit payload string, generates shellcode
 with `msfvenom`, encrypts it (AES‑256‑CBC or XOR depending on format), and
 outputs ready‑to‑deliver files — macros, HTA pages, MSBuild XML, compiled
 binaries, and Linux loaders — together with the exact msfconsole handler and
-delivery commands.
+delivery commands. This tool is intended strictly for educational use in CTF platforms and self‑owned lab environments.
+
+
+The author explicitly does not authorise use of tomcrypt against any system, network, or organisation that you do not personally own or do not hold prior written authorisation to test. Unauthorised use is a criminal offence under the Computer Misuse Act 1990 (UK), the Computer Fraud and Abuse Act (US), and equivalent legislation worldwide.
+
+It is published for its educational value to help people understand how these delivery methods work so they can be studied, defended against, and tested in controlled environments such as HackTheBox, TryHackMe, and private lab networks the user personally owns or has permission to operate.
 
 ```bash
 python3 tomcrypt.py --help
