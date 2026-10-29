@@ -470,4 +470,4 @@ open an issue saying what it's for and we can talk.
 
 ## License
 
-[MIT](LICENSE).
+MIT
