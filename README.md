@@ -1,10 +1,227 @@
+# TomSploit
+
+A small toolkit for authorised network assessment work. Two tools, both
+enumeration‑first: they find and report, then hand you the exact
+follow‑up commands. Neither exploits, dumps, or loots.
+
+| Tool | What it does |
+|------|--------------|
+| [**tombuster**](#tombuster) | Staged `nmap` recon. Maps and names a whole subnet, reports on every host, then runs the slow per‑host enumeration. |
+| [**tomsploit**](#tomsploit) | Fast [NetExec](https://github.com/Pennyw0rth/NetExec) (`nxc`) triage. Sprays a credential set across protocols, confirms what's valid, and writes a Kerberos delegation walkthrough. |
+
+The usual order is `tombuster` first — it tells you what's on the wire and
+which hosts are domain controllers — then `tomsploit` once you have a
+credential to try.
+
+> Use only against systems you are authorised to test.
+
+---
+
+## Install
+
+Both tools ship as zipapps. No `pip install`, no dependencies beyond the
+standard library and the external scanner each one drives.
+
+```bash
+git clone https://github.com/twhitehead290/TomSploit.git
+cd TomSploit
+```
+
+`tomsploit.pyz` carries a shebang, so it can be run directly:
+
+```bash
+chmod +x tomsploit.pyz
+./tomsploit.pyz --help
+```
+
+`tombuster.pyz` has no shebang — invoke it through the interpreter:
+
+```bash
+python3 tombuster.pyz --help
+```
+
+Or copy either one where you need it:
+
+```bash
+scp tombuster.pyz kali@box:/tmp/ && ssh kali@box sudo python3 /tmp/tombuster.pyz -h
+```
+
+**Requirements**
+
+- **Python 3.10+** (both tools use `X | None` type syntax).
+- **[nmap](https://nmap.org/)** on `PATH` — tombuster's scanning engine.
+  Run it with `sudo` or `cap_net_raw`; unprivileged it falls back to a
+  connect scan and cannot do UDP at all.
+- **[NetExec](https://github.com/Pennyw0rth/NetExec)** (`nxc`) on `PATH` —
+  tomsploit's scanning engine.
+- Optional, only for tomsploit's `-k` ticket conversion:
+  `impacket-ticketConverter`.
+
+The **generated commands** reference the usual AD toolkit (impacket,
+hashcat, certipy, BloodHound, krbrelayx, PetitPotam, Rubeus, …). You run
+those yourself; neither tool requires them to be installed to *emit* the
+commands.
+
+---
+
+# tombuster
+
+Staged `nmap` reconnaissance. The point is that you never pass ports
+between stages by hand, and that a partial picture is never dressed up as
+a complete one.
+
+```bash
+sudo python3 tombuster.pyz -t 10.10.10.0/24
+```
+
+## The pipeline
+
+Run‑level first, across every host at once, before any per‑host work:
+
+| Stage | Name | What it does |
+|-------|------|--------------|
+| 0 | discovery | Sweep the CIDR/range for live hosts |
+| 0b | triage | One ordinary nmap over all of them |
+| 0c | identify | Who each host is: name, light `-sV`, SMB signing |
+| 0d | assessment | Recommendations for **every** host, printed and written to `initial-assessment.md` |
+
+Then per host:
+
+| Stage | Name | What it does |
+|-------|------|--------------|
+| 1 | tcp-initial | nmap's default port selection |
+| 2 | tcp-detail | `-A --script default` over those ports — `report.md` lands here |
+| 3 | tcp-all | All 65535 TCP ports |
+| 4 | tcp-detail-new | `-A` over whatever stage 3 added, if anything |
+| 5 | tcp-vuln | The `vuln` script category, all ports |
+| — | udp | 20 curated UDP ports, alongside everything from the start, privileges permitting |
+
+A service‑aware recommendation engine then turns the results into next
+steps, every one of which traces back to an observed service or an
+explicit scan finding.
+
+## Three invariants
+
+These are the reason the code is shaped the way it is:
+
+- **A skipped phase is never reported as a result.** "UDP was not scanned"
+  and "UDP was scanned and nothing answered" are different facts, and the
+  reports keep them different.
+- **A vulnerability is never claimed from an open port or an old‑looking
+  banner.** Findings carry how well the scan actually supports them.
+- **The early assessment is always labelled provisional.** Reporting
+  before the slow phases is only safe if a partial picture cannot be
+  mistaken for a complete one.
+
+Privilege level is stated honestly too — an unprivileged connect scan is a
+different measurement, not a slower equivalent, so tombuster says which
+one it ran.
+
+## Output
+
+```
+scans/START-HERE.md                  which of these to open, with links
+scans/<spec>/live_hosts.txt          every host the sweep found, one per
+                                     line, written as soon as it ends
+scans/<spec>/services.txt            host/port/state/service/evidence/
+                                     banner, tab-separated, rewritten as
+                                     each phase adds to it
+scans/<spec>/initial-assessment.md   all hosts, address order, provisional
+scans/<spec>/environment.md          domain, DCs, /etc/hosts, cred plan
+scans/<host>/report.md               one host, full detail
+scans/<host>/raw/                    nmap's own .xml and .gnmap, per phase,
+                                     so any claim above can be checked
+```
+
+`environment.md` is the handoff to tomsploit: it names the domain and the
+domain controllers.
+
+## Usage
+
+```bash
+# Whole subnet, everything
+sudo python3 tombuster.pyz -t 10.10.10.0/24
+
+# Through a tunnel (ligolo-ng and similar): SYN-only sweep, -n, one retry
+sudo python3 tombuster.pyz -t 10.10.10.0/24 --pivot
+
+# Stop after -A over the default ports — the usual stopping place
+sudo python3 tombuster.pyz -t 10.10.10.0/24 --until detail
+
+# Just: what is alive
+sudo python3 tombuster.pyz -t 10.10.10.0/24 --until discovery
+
+# Reuse per-host phases that completed in a previous run
+sudo python3 tombuster.pyz -t 10.10.10.5 --resume
+```
+
+`--until` takes any of `discovery, triage, assess, initial, detail, full,
+vuln, all` (default `all`), and forgives the obvious synonyms — `sweep`,
+`hosts`, `ports`, `quick`, `services`, `allports` and friends all resolve
+to the right point. Recommendations are always produced for whatever was
+reached.
+
+## Key options
+
+```
+-t, --target SPEC       host, comma list, CIDR/range, or a file of hosts;
+                        repeatable
+-o, --output-dir DIR    where scan directories go
+
+stages
+--until POINT           stop after this point and report on what was found
+--no-discovery          scan every address instead of sweeping for live hosts
+--no-triage             skip stage 0b, and 0c/0d with it
+--no-identify           skip stage 0c (no hostnames, no versions in 0d)
+--no-rdns               don't use a discovered nameserver for reverse lookups
+--resume                reuse per-host phases from a previous run
+
+depth
+--skip-full             skip the full -p- sweep
+--no-vuln               skip the intrusive scripts — much faster
+--skip-mail             leave smtp-open-relay out
+--min-cvss N            only report vulners CVEs at or above this score
+--skip-udp              skip the UDP scan
+--udp-ports LIST        UDP ports for the concurrent scan
+
+nmap tuning
+--pivot                 through a tunnel: SYN-only sweep, -n, one retry
+--discovery-ports LIST  stage 0 SYN probe ports — a host whose only open
+                        port is missing here is invisible to the sweep
+--identity-intensity N  stage 0c -sV intensity (0-9, or -1 to drop -sV)
+--identity-max-ports N  cap stage 0c's port list
+--min-rate N            nmap --min-rate, phase 2 only
+--max-retries N         nmap --max-retries for the TCP sweeps
+--host-timeout TIME     nmap --host-timeout, e.g. 30m
+--timeout SEC           wall-clock ceiling per stage
+-n, --no-dns            never resolve names
+--nmap-arg ARG          one extra nmap argument, repeatable; never goes
+                        through a shell
+--max-hosts N           refuse a run resolving more than N hosts
+                        (default 64; 0 disables)
+
+output
+-v / -vv                each host's report as it finishes / nmap's raw output
+--json PATH             also write everything as JSON
+--no-report             don't write report.md
+--no-color              disable colour (automatic when piped)
+```
+
+---
+
 # tomsploit
 
-Fast [NetExec](https://github.com/Pennyw0rth/NetExec) (`nxc`) triage across protocols and targets.
+Fast NetExec triage across protocols and targets.
 
-`tomsploit` sprays a credential set against every available protocol, confirms which logins are valid, and prints the **exact follow‑up commands** for each win — already filled in with the target, domain, username and credential. When a login works on a domain controller it runs a read‑only enrichment pass and writes a per‑account **Kerberos delegation walkthrough** to disk.
+`tomsploit` sprays a credential set against every available protocol,
+confirms which logins are valid, and prints the **exact follow‑up
+commands** for each win — already filled in with the target, domain,
+username and credential. When a login works on a domain controller it runs
+a read‑only enrichment pass and writes a per‑account **Kerberos delegation
+walkthrough** to disk.
 
-It is a careful `nxc` front‑end with a context‑aware command generator, **not** a one‑shot attack‑and‑loot engine.
+It is a careful `nxc` front‑end with a context‑aware command generator,
+**not** a one‑shot attack‑and‑loot engine.
 
 ```
 $ tomsploit -t 10.129.205.35 -u carole.rose -p 'jasmine'
@@ -22,45 +239,68 @@ $ tomsploit -t 10.129.205.35 -u carole.rose -p 'jasmine'
       full commands → tomsploit-delegation-10.129.205.35-carole.rose.txt
 ```
 
----
-
 ## Scope
 
-**Enumeration only.** `tomsploit` finds and reports access — and flags relay‑able hosts, domain controllers, anonymous access, and credentials that are valid‑but‑unusable — but it does not exploit, dump, or loot. Every enrichment query reads the directory; nothing is modified. The tool hands you the commands to take the next step yourself.
+**Enumeration only.** `tomsploit` finds and reports access — and flags
+relay‑able hosts, domain controllers, anonymous access, and credentials
+that are valid‑but‑unusable — but it does not exploit, dump, or loot.
+Every enrichment query reads the directory; nothing is modified. The tool
+hands you the commands to take the next step yourself.
 
-This makes it well suited to lab/OSCP/OSEP‑style workflows and authorised engagements where you want a fast read on what a credential unlocks and a ready‑to‑run plan for each finding.
-
-> Use only against systems you are authorised to test.
-
----
+This makes it well suited to lab/OSCP‑style workflows and authorised
+engagements where you want a fast read on what a credential unlocks and a
+ready‑to‑run plan for each finding.
 
 ## Features
 
-- **Multi‑protocol spray** across `smb, ssh, ldap, ftp, wmi, winrm, rdp, vnc, mssql, nfs` (VNC and NFS off by default), domain and local‑auth in one pass.
-- **Flexible credentials:** password, NTLM hash (Pass‑the‑Hash), Kerberos ticket cache, or a `user:secret` combo file. Cross‑spray or positional pairing.
-- **Context‑aware next commands** per valid login, with a one‑line outcome hint on each ("what a hit looks like and where it leads", not a description of the command).
-- **Pre‑flight port probe** to skip protocols whose port is closed, and lockout‑aware spray accounting.
-- **Relay / DC / anonymous‑access detection** surfaced as first‑class findings.
-- **Automatic Kerberos delegation engine** (see below) — the headline feature.
-- **Three verbosity levels** for the command output: `--bare` (commands only), default (commands + one‑line hints), `--notes` (full reasoning and caveats).
+- **Multi‑protocol spray** across `smb, ssh, ldap, ftp, wmi, winrm, rdp,
+  vnc, mssql, nfs` (VNC and NFS off by default), domain and local‑auth in
+  one pass.
+- **Flexible credentials:** password, NTLM hash (Pass‑the‑Hash), Kerberos
+  ticket cache, or a `user:secret` combo file. Cross‑spray or positional
+  pairing.
+- **Context‑aware next commands** per valid login, with a one‑line outcome
+  hint on each ("what a hit looks like and where it leads", not a
+  description of the command).
+- **Pre‑flight port probe** to skip protocols whose port is closed, and
+  lockout‑aware spray accounting.
+- **Relay / DC / anonymous‑access detection** surfaced as first‑class
+  findings.
+- **Automatic Kerberos delegation engine** (see below) — the headline
+  feature.
+- **Three verbosity levels** for the command output: `--bare` (commands
+  only), default (commands + one‑line hints), `--notes` (full reasoning
+  and caveats).
 - **Paste‑ready script output** with `--sh`.
-- **Single file, no install** — `scp tomsploit.py` onto a box and run it.
-
----
 
 ## The delegation engine
 
-When an LDAP credential works on a DC, `tomsploit` runs a batch of read‑only queries and turns the results into an actionable, per‑account Kerberos‑delegation plan.
+When an LDAP credential works on a DC, `tomsploit` runs a batch of
+read‑only queries and turns the results into an actionable, per‑account
+Kerberos‑delegation plan.
 
-It enumerates delegation with `--find-delegation`, then resolves each finding with targeted queries so the routes are **decisions, not homework**:
+It enumerates delegation with `--find-delegation`, then resolves each
+finding with targeted queries so the routes are **decisions, not
+homework**:
 
-- **Roastability** — for each delegating account, is it kerberoastable (`servicePrincipalName`) or AS‑REP‑roastable (`userAccountControl`) *right now*? The route emits the exact roast command instead of "kerberoast it if it has an SPN".
-- **Disabled accounts** — a route on a disabled account is marked dead up front.
-- **MachineAccountQuota** — resolves whether RBCD "add a computer" is even possible (`MAQ 0` → path dead).
-- **`msDS-AllowedToDelegateTo`** — the full constrained‑delegation target list, so "this delegates to the DC" (→ DCSync via an `ldap/` sname swap) is detected authoritatively.
-- **Direct‑ACE writers** (`daclread`, per account) — who can write the account's SPN / RBCD attribute, for the direct‑ACE case. Group‑inherited rights are invisible to this and the output says so, pointing you to BloodHound.
+- **Roastability** — for each delegating account, is it kerberoastable
+  (`servicePrincipalName`) or AS‑REP‑roastable (`userAccountControl`)
+  *right now*? The route emits the exact roast command instead of
+  "kerberoast it if it has an SPN".
+- **Disabled accounts** — a route on a disabled account is marked dead up
+  front.
+- **MachineAccountQuota** — resolves whether RBCD "add a computer" is even
+  possible (`MAQ 0` → path dead).
+- **`msDS-AllowedToDelegateTo`** — the full constrained‑delegation target
+  list, so "this delegates to the DC" (→ DCSync via an `ldap/` sname swap)
+  is detected authoritatively.
+- **Direct‑ACE writers** (`daclread`, per account) — who can write the
+  account's SPN / RBCD attribute, for the direct‑ACE case.
+  Group‑inherited rights are invisible to this and the output says so,
+  pointing you to BloodHound.
 
-Each abusable delegation is written to `tomsploit-delegation-<ip>-<user>.txt` as a self‑contained route:
+Each abusable delegation is written to
+`tomsploit-delegation-<ip>-<user>.txt` as a self‑contained route:
 
 ```
 # ╭─────────────────────────────────────────────────────────────────────────╮
@@ -78,9 +318,6 @@ Each abusable delegation is written to `tomsploit-delegation-<ip>-<user>.txt` as
     nxc ldap 10.129.205.35 -u carole.rose -p 'jasmine' \
       --kerberoasting beth.richards.roast --kerberoast-account beth.richards
     hashcat -m 13100 beth.richards.roast /usr/share/wordlists/rockyou.txt
-    # dump every credential in the domain:
-    impacket-getST -spn TERMSRV/DC01.INLANEFREIGHT.LOCAL -altservice ldap/DC01.INLANEFREIGHT.LOCAL \
-      -impersonate administrator 'INLANEFREIGHT.LOCAL/beth.richards:<beth.richards-PASSWORD>' -dc-ip 10.129.205.35
     ...
 ```
 
@@ -95,42 +332,23 @@ Each route reads:
 
 Notes on the generated file:
 
-- **Values are filled in.** DC name/FQDN, your account, chosen passwords — only genuinely unknown things (a secret you haven't cracked, a runtime ticket blob) stay as `<placeholders>`.
-- **It's aware of the account you ran as.** If a route is *for* the account you authenticated with, it doesn't tell you to roast a password you already hold — it uses your real credential and marks the secret as held.
-- **It's paste‑safe.** Drop the file into a shell and it runs only the fully‑resolved commands; anything with an unfilled `<placeholder>` is commented out. Every value pulled from Active Directory (account names, SPNs, ACL trustees) is sanitised, so a hostile object name can't inject a command.
-- **The commands use the correct impacket syntax** — passwords go in the identity string (`domain/user:password`), because `getST`/`rbcd`/`addcomputer` have no `-p` flag.
+- **Values are filled in.** DC name/FQDN, your account, chosen passwords —
+  only genuinely unknown things (a secret you haven't cracked, a runtime
+  ticket blob) stay as `<placeholders>`.
+- **It's aware of the account you ran as.** If a route is *for* the account
+  you authenticated with, it doesn't tell you to roast a password you
+  already hold — it uses your real credential and marks the secret as held.
+- **It's paste‑safe.** Drop the file into a shell and it runs only the
+  fully‑resolved commands; anything with an unfilled `<placeholder>` is
+  commented out. Every value pulled from Active Directory (account names,
+  SPNs, ACL trustees) is sanitised, so a hostile object name can't inject
+  a command.
+- **The commands use the correct impacket syntax** — passwords go in the
+  identity string (`domain/user:password`), because
+  `getST`/`rbcd`/`addcomputer` have no `-p` flag.
 
-Disable the whole pass with `--no-enrich`. Run the same engine offline on `findDelegation` output you already have with `--deleg-in` (see below).
-
----
-
-## Requirements
-
-- **Python 3.10+** (uses `X | None` type syntax).
-- **[NetExec](https://github.com/Pennyw0rth/NetExec)** (`nxc`) on `PATH` — the scanning engine.
-- Standard library only; no `pip install` for tomsploit itself.
-- Optional, only for `-k` ticket conversion: `impacket-ticketConverter`.
-
-The **generated commands** reference the usual AD toolkit (impacket, hashcat, certipy, BloodHound, krbrelayx, PetitPotam, Rubeus, …). You run those yourself; tomsploit doesn't require them to be installed to *emit* the commands.
-
----
-
-## Install
-
-```bash
-git clone https://github.com/<you>/tomsploit.git
-cd tomsploit
-chmod +x tomsploit.py
-./tomsploit.py --help
-```
-
-Or just copy the one file where you need it:
-
-```bash
-scp tomsploit.py kali@box:/tmp/ && ssh kali@box python3 /tmp/tomsploit.py -h
-```
-
----
+Disable the whole pass with `--no-enrich`. Run the same engine offline on
+`findDelegation` output you already have with `--deleg-in`.
 
 ## Usage
 
@@ -187,8 +405,6 @@ nxc ldap 10.10.10.5 -u u -p p --find-delegation \
 | `-v` / `--verbose` | every `nxc` line, including each failed login |
 | `--sh` | flush‑left, uncoloured, paste‑ready shell script |
 
----
-
 ## Key options
 
 ```
@@ -218,13 +434,27 @@ Run `tomsploit --help` for the complete list.
 
 ## Safety & correctness notes
 
-- **Read‑only by design.** The enrichment pass and every generated‑file value come from directory reads; tomsploit itself performs no writes.
-- **Generated files hold live credentials.** The delegation file prints the credential it ran with (it's already in the runnable commands), so treat `tomsploit-delegation-*.txt` as sensitive.
-- **Parsing is verified against tool source** (NetExec, impacket) and hardened against malformed, partial, and adversarial output — but the parsers should be sanity‑checked against a real DC's live output on first use in a new environment; `--no-enrich` restores plain behaviour if anything looks off.
-- **A louder footprint with enrichment on** — a DC login fires roughly a dozen `nxc` queries. Use `--no-enrich` on a monitored engagement if that matters.
+- **Read‑only by design.** Both tools measure and report. tomsploit's
+  enrichment pass and every generated‑file value come from directory
+  reads; it performs no writes. tombuster drives nmap and parses what
+  comes back.
+- **Generated files hold live credentials.** tomsploit's delegation file
+  prints the credential it ran with (it's already in the runnable
+  commands), so treat `tomsploit-delegation-*.txt` as sensitive.
+- **Parsing is verified against tool source** (nmap, NetExec, impacket)
+  and hardened against malformed, partial, and adversarial output — but
+  the parsers should be sanity‑checked against a real environment's live
+  output on first use; `--no-enrich` restores tomsploit's plain behaviour
+  if anything looks off.
+- **A louder footprint with enrichment on** — a DC login fires roughly a
+  dozen `nxc` queries. Use `--no-enrich` on a monitored engagement if that
+  matters. tombuster's `--no-vuln` and `--until detail` are the equivalent
+  levers.
+- **tombuster refuses runs over 64 resolved hosts** by default
+  (`--max-hosts`), so a mistyped CIDR doesn't become an incident.
 
 ---
 
 ## License
 
-MIT. See the license block at the end of `tomsploit.py`.
+MIT.
