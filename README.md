@@ -7,7 +7,7 @@ the full lab pipeline: recon, credential triage, and payload delivery.
 |------|--------------|
 | [**tombuster**](#tombuster) | Staged `nmap` recon. Maps and names a whole subnet, reports on every host, then runs the slow per‑host enumeration. |
 | [**tomsploit**](#tomsploit) | Fast [NetExec](https://github.com/Pennyw0rth/NetExec) (`nxc`) triage. Sprays a credential set across protocols, confirms what's valid, and writes a Kerberos delegation walkthrough. |
-| [**tomcrypt**](#tomcrypt) | Payload generator. Encrypts msfvenom shellcode (AES‑256‑CBC or XOR) and wraps it in a choice of delivery formats: VBA macros, HTA files, MSBuild XML, process hollowing, Remote Template Injection, Ligolo‑ng tunnel, and Linux loaders. |
+| [**tomcrypt**](#tomcrypt) | Educational dual‑use payload generator for CTF and lab environments. Encrypts msfvenom shellcode (AES‑256‑CBC or XOR) and wraps it in a choice of delivery formats: VBA macros, HTA files, MSBuild XML, process hollowing, Remote Template Injection, Ligolo‑ng tunnel, and Linux loaders. CTF/lab use only |
 
 The usual order is `tombuster` first — it tells you what's on the wire and
 which hosts are domain controllers — then `tomsploit` once you have a
